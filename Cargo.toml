@@ -12,4 +12,4 @@ homepage = "https://octelium.com"
 [workspace.dependencies]
 # Kept in lockstep with crates/octelium-apis, which is generated from the
 # Octelium protobuf definitions and synced into this repository by CI.
-octelium-apis = { version = "0.1.0-dev", path = "crates/octelium-apis", default-features = false }
+octelium-apis = { version = "0.1.3", path = "crates/octelium-apis", default-features = false }
