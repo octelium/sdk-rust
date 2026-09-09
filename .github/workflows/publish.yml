@@ -1,0 +1,91 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      # crates/octelium-apis, pushed by the API generator.
+      - "apis/v*"
+      # crates/octelium, the SDK itself.
+      - "sdk/v*"
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: The crate to publish
+        required: true
+        type: choice
+        options: [octelium-apis, octelium]
+      dry_run:
+        description: Package without publishing
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve the crate and version
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            CRATE="${{ inputs.crate }}"
+            TAG_VERSION=""
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+            case "$TAG" in
+              apis/v*) CRATE="octelium-apis"; TAG_VERSION="${TAG#apis/v}" ;;
+              sdk/v*)  CRATE="octelium";      TAG_VERSION="${TAG#sdk/v}"  ;;
+              *) echo "Unsupported tag: $TAG" >&2; exit 1 ;;
+            esac
+          fi
+
+          case "$CRATE" in
+            octelium-apis) MANIFEST="crates/octelium-apis/Cargo.toml" ;;
+            octelium)      MANIFEST="crates/octelium/Cargo.toml" ;;
+            *) echo "Unknown crate: $CRATE" >&2; exit 1 ;;
+          esac
+
+          VERSION="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg crate "$CRATE" '.packages[] | select(.name == $crate) | .version')"
+
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Could not read the version of $CRATE" >&2
+            exit 1
+          fi
+
+          if [ -n "$TAG_VERSION" ] && [ "$TAG_VERSION" != "$VERSION" ]; then
+            echo "Tag version $TAG_VERSION does not match $MANIFEST version $VERSION" >&2
+            exit 1
+          fi
+
+          echo "crate=$CRATE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing $CRATE v$VERSION"
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+      - name: Package
+        run: cargo package -p ${{ steps.target.outputs.crate }}
+
+      - name: Publish
+        if: github.event_name != 'workflow_dispatch' || !inputs.dry_run
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p ${{ steps.target.outputs.crate }}

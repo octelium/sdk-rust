@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+  features:
+    name: Feature combinations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: gRPC only
+        run: cargo check -p octelium --no-default-features --features tls-native-roots
+
+      - name: Bundled TLS roots
+        run: cargo check -p octelium --no-default-features --features http,tls-webpki-roots
+
+      - name: APIs without a transport
+        run: cargo check -p octelium-apis --no-default-features --features client
+
+      - name: APIs with server stubs
+        run: cargo check -p octelium-apis --features server
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the MSRV from the workspace
+        id: msrv
+        run: |
+          set -euo pipefail
+          MSRV="$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)"
+          echo "version=$MSRV" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo check --workspace --all-features
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings --cfg docsrs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo doc --workspace --all-features --no-deps
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Package octelium-apis
+        run: cargo package -p octelium-apis
+
+      # The SDK depends on the version of octelium-apis in this workspace,
+      # which is not on crates.io until it is released, so a full package run
+      # cannot resolve it. The publish workflow packages it for real, after
+      # octelium-apis has been released.
+      - name: Check the contents of the octelium package
+        run: cargo package --list -p octelium

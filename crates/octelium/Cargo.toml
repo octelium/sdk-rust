@@ -1,0 +1,64 @@
+[package]
+name = "octelium"
+version = "0.1.0"
+description = "The official Rust SDK for Octelium: authenticated gRPC and HTTP clients for Octelium Clusters"
+readme = "README.md"
+documentation = "https://docs.rs/octelium"
+keywords = ["octelium", "grpc", "zero-trust", "sdk", "tonic"]
+categories = ["api-bindings", "network-programming", "authentication"]
+include = ["src/**/*", "examples/**/*", "Cargo.toml", "README.md", "LICENSE"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = ["http", "tls-native-roots"]
+# An authenticated HTTP client for Octelium Services.
+http = ["dep:reqwest", "dep:url"]
+# Verify Cluster certificates against the host's certificate store.
+tls-native-roots = ["tonic/tls-native-roots"]
+# Verify Cluster certificates against the certificates compiled into webpki-roots.
+tls-webpki-roots = ["tonic/tls-webpki-roots"]
+
+[dependencies]
+octelium-apis = { workspace = true, features = ["client", "channel"] }
+
+async-trait = "0.1"
+http = "1"
+idna = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "sync", "time"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "tls-ring"] }
+tower-service = "0.3"
+tracing = "0.1"
+
+reqwest = { version = "0.13", default-features = false, features = [
+    "charset",
+    "http2",
+    "json",
+    "query",
+    "rustls-no-provider",
+    "system-proxy",
+], optional = true }
+url = { version = "2", optional = true }
+
+[dev-dependencies]
+octelium-apis = { workspace = true, features = ["client", "channel", "server"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["router", "server"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[example]]
+name = "list_users"
+
+[[example]]
+name = "http_service"
+required-features = ["http"]
