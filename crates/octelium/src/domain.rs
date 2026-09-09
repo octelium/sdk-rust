@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "http")]
 use std::net::IpAddr;
 
 use crate::error::{Error, Result};
@@ -45,6 +46,7 @@ pub(crate) fn normalize(domain: impl AsRef<str>) -> Result<String> {
 }
 
 /// Normalizes an HTTP host, which may also be an IP address literal.
+#[cfg(feature = "http")]
 pub(crate) fn normalize_host(host: impl AsRef<str>) -> Result<String> {
     let host = host.as_ref().trim().trim_end_matches('.');
 
@@ -89,6 +91,7 @@ pub(crate) fn normalize_endpoint(endpoint: &str) -> Result<String> {
 }
 
 /// Reports whether `host` is the Cluster domain or one of its subdomains.
+#[cfg(feature = "http")]
 pub(crate) fn is_within(host: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
@@ -142,6 +145,7 @@ mod tests {
         assert!(normalize_endpoint("  ").is_err());
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn subdomains_belong_to_the_cluster() {
         assert!(is_within("example.com", "example.com"));

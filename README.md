@@ -50,7 +50,8 @@ cargo run --example http_service -- https://my-service.example.com/api
 
 ## Supported Rust version
 
-The SDK builds on Rust 1.85 and later.
+The SDK builds on Rust 1.88 and later, which is the minimum required by
+`tonic` 0.14.
 
 ## Development
 
