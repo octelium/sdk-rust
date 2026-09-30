@@ -59,6 +59,7 @@ struct Inner {
     cfg: Config,
     tokens: Arc<TokenManager>,
     closed: AtomicBool,
+    close_cancel: tokio_util::sync::CancellationToken,
 
     /// The shared connection to the Cluster API. tonic reconnects on its own,
     /// so it is created lazily and never dialed here.
@@ -109,6 +110,7 @@ impl Client {
                 cfg,
                 tokens,
                 closed: AtomicBool::new(false),
+                close_cancel: tokio_util::sync::CancellationToken::new(),
                 channel,
                 auth,
                 #[cfg(feature = "http")]
@@ -143,17 +145,29 @@ impl Client {
             return Ok(token);
         }
 
-        let _guard = self.inner.tokens.refresh_lock.lock().await;
+        // The worker owns the exchange independently of callers. Dropping a
+        // caller must not lose a one-time credential or a rotated refresh token.
+        let client = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = client.inner.close_cancel.cancelled() => Err(Error::Closed),
+                result = client.token_locked() => result,
+            }
+        })
+        .await
+        .map_err(|err| Error::authentication(message(format!("token task failed: {err}"))))?
+    }
 
+    async fn token_locked(&self) -> Result<AccessToken> {
+        let _guard = self.inner.tokens.refresh_lock.lock().await;
         self.ensure_open()?;
         if let Some(token) = self.inner.tokens.current(Instant::now()) {
             return Ok(token);
         }
-
         if self.inner.cfg.token_provider.is_some() {
             return self.obtain_external_token().await;
         }
-
         self.obtain_managed_token().await
     }
 
@@ -217,6 +231,7 @@ impl Client {
     /// dropped. It does not log out.
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
+        self.inner.close_cancel.cancel();
         self.inner.tokens.clear();
     }
 
@@ -431,6 +446,9 @@ impl Client {
         let auth = self.inner.auth.clone();
         let scopes = self.inner.cfg.scopes.clone();
 
+        // An attempted one-time exchange may have reached the server even
+        // when it times out or its response is lost. Never replay it.
+        self.inner.tokens.mark_authentication_attempt();
         let token = self
             .with_timeout(async move {
                 authenticator

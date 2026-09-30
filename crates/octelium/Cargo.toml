@@ -1,6 +1,6 @@
 [package]
 name = "octelium"
-version = "0.1.0"
+version = "0.1.1"
 description = "The official Rust SDK for Octelium: authenticated gRPC and HTTP clients for Octelium Clusters"
 readme = "README.md"
 documentation = "https://docs.rs/octelium"
@@ -34,6 +34,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs", "sync", "time"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "tls-ring"] }
 tower-service = "0.3"
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 
 reqwest = { version = "0.13", default-features = false, features = [

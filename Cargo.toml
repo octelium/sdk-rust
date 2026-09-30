@@ -1,6 +1,6 @@
 [workspace]
-resolver = "2"
-members = ["crates/octelium", "crates/octelium-apis"]
+resolver = "3"
+members = ["crates/octelium", "crates/octelium-apis", "crates/cordium"]
 
 [workspace.package]
 edition = "2021"
@@ -12,4 +12,5 @@ homepage = "https://octelium.com"
 [workspace.dependencies]
 # Kept in lockstep with crates/octelium-apis, which is generated from the
 # Octelium protobuf definitions and synced into this repository by CI.
-octelium-apis = { version = "0.1.3", path = "crates/octelium-apis", default-features = false }
+# Pin the tested model layout: additive protobuf fields can change Rust struct literals.
+octelium-apis = { version = "=0.1.4", path = "crates/octelium-apis", default-features = false }

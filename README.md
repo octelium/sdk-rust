@@ -1,10 +1,19 @@
-# Octelium Rust SDK
+# Rust SDKs for Cordium and Octelium
+
+The [Cordium SDK](crates/cordium/README.md) provides ergonomic async workspace
+lifecycle, command execution, files, terminals, storage, and resource management.
+Start with its [quickstart example](crates/cordium/examples/quickstart.rs).
+The `octelium` crate supplies the shared authenticated transport, and
+`octelium-apis` supplies generated protobuf models and clients.
+
+## Octelium Rust SDK
 
 The official Rust SDK for [Octelium](https://octelium.com), plus the generated
 protobuf types and gRPC clients for the Cluster APIs.
 
 | Crate | Description |
 | --- | --- |
+| [`cordium`](crates/cordium) | Async workspace lifecycle, execution, files, terminals, storage, and resources. |
 | [`octelium`](crates/octelium) [![crates.io](https://img.shields.io/crates/v/octelium.svg)](https://crates.io/crates/octelium) [![docs.rs](https://img.shields.io/docsrs/octelium)](https://docs.rs/octelium) | Authenticated gRPC and HTTP clients for Octelium Clusters. |
 | [`octelium-apis`](crates/octelium-apis) [![crates.io](https://img.shields.io/crates/v/octelium-apis.svg)](https://crates.io/crates/octelium-apis) [![docs.rs](https://img.shields.io/docsrs/octelium-apis)](https://docs.rs/octelium-apis) | Generated `prost` types and `tonic` clients for the Cluster APIs. |
 

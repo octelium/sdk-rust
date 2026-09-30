@@ -200,6 +200,11 @@ impl TokenManager {
         self.ever_authenticated.load(Ordering::Relaxed)
     }
 
+    /// Remembers an attempted exchange, including one that fails or is canceled.
+    pub(crate) fn mark_authentication_attempt(&self) {
+        self.ever_authenticated.store(true, Ordering::Relaxed);
+    }
+
     /// Stores a Cluster Session. A Session token without a refresh token keeps
     /// the previous one, which the Cluster omits when it is unchanged.
     pub(crate) fn set_session(

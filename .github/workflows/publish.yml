@@ -7,13 +7,14 @@ on:
       - "apis/v*"
       # crates/octelium, the SDK itself.
       - "sdk/v*"
+      - "cordium/v*"
   workflow_dispatch:
     inputs:
       crate:
         description: The crate to publish
         required: true
         type: choice
-        options: [octelium-apis, octelium]
+        options: [octelium-apis, octelium, cordium]
       dry_run:
         description: Package without publishing
         type: boolean
@@ -51,6 +52,7 @@ jobs:
             case "$TAG" in
               apis/v*) CRATE="octelium-apis"; TAG_VERSION="${TAG#apis/v}" ;;
               sdk/v*)  CRATE="octelium";      TAG_VERSION="${TAG#sdk/v}"  ;;
+              cordium/v*) CRATE="cordium"; TAG_VERSION="${TAG#cordium/v}" ;;
               *) echo "Unsupported tag: $TAG" >&2; exit 1 ;;
             esac
           fi
@@ -58,6 +60,7 @@ jobs:
           case "$CRATE" in
             octelium-apis) MANIFEST="crates/octelium-apis/Cargo.toml" ;;
             octelium)      MANIFEST="crates/octelium/Cargo.toml" ;;
+            cordium)       MANIFEST="crates/cordium/Cargo.toml" ;;
             *) echo "Unknown crate: $CRATE" >&2; exit 1 ;;
           esac
 

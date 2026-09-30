@@ -146,7 +146,11 @@ impl HttpClient {
     pub fn request(&self, method: Method, url: impl reqwest::IntoUrl) -> RequestBuilder {
         RequestBuilder {
             http: self.clone(),
-            inner: self.inner.request(method, url),
+            // Keep URL userinfo intact until destination authorization. The
+            // normal reqwest constructor removes it and synthesizes Basic auth.
+            inner: url.into_url().map(|url| {
+                reqwest::RequestBuilder::from_parts(self.inner.clone(), Request::new(method, url))
+            }),
         }
     }
 
@@ -241,10 +245,17 @@ impl HttpClient {
 /// It mirrors [`reqwest::RequestBuilder`], and
 /// [`with`](RequestBuilder::with) hands the inner builder over for anything
 /// not covered here.
-#[derive(Debug)]
 pub struct RequestBuilder {
     http: HttpClient,
-    inner: reqwest::RequestBuilder,
+    inner: std::result::Result<reqwest::RequestBuilder, reqwest::Error>,
+}
+impl std::fmt::Debug for RequestBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // An unbuilt request may carry URL userinfo; never include it in Debug.
+        f.debug_struct("RequestBuilder")
+            .field("http", &self.http)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RequestBuilder {
@@ -256,37 +267,37 @@ impl RequestBuilder {
         HeaderValue: TryFrom<V>,
         <HeaderValue as TryFrom<V>>::Error: Into<::http::Error>,
     {
-        self.inner = self.inner.header(key, value);
+        self.inner = self.inner.map(|builder| builder.header(key, value));
         self
     }
 
     /// Adds a set of headers to the request.
     pub fn headers(mut self, headers: ::http::HeaderMap) -> Self {
-        self.inner = self.inner.headers(headers);
+        self.inner = self.inner.map(|builder| builder.headers(headers));
         self
     }
 
     /// Appends the serialized parameters to the URL query string.
     pub fn query<T: serde::Serialize + ?Sized>(mut self, query: &T) -> Self {
-        self.inner = self.inner.query(query);
+        self.inner = self.inner.map(|builder| builder.query(query));
         self
     }
 
     /// Sets the JSON request body.
     pub fn json<T: serde::Serialize + ?Sized>(mut self, json: &T) -> Self {
-        self.inner = self.inner.json(json);
+        self.inner = self.inner.map(|builder| builder.json(json));
         self
     }
 
     /// Sets the request body.
     pub fn body(mut self, body: impl Into<reqwest::Body>) -> Self {
-        self.inner = self.inner.body(body);
+        self.inner = self.inner.map(|builder| builder.body(body));
         self
     }
 
     /// Bounds this request, overriding the client's timeout.
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.inner = self.inner.timeout(timeout);
+        self.inner = self.inner.map(|builder| builder.timeout(timeout));
         self
     }
 
@@ -296,7 +307,7 @@ impl RequestBuilder {
     /// # async fn run(http: octelium::HttpClient) -> Result<(), Box<dyn std::error::Error>> {
     /// let resp = http
     ///     .post("https://api.example.com/v1/items")
-    ///     .with(|builder| builder.basic_auth("user", Some("pass")))
+    ///     .with(|builder| builder.version(reqwest::Version::HTTP_11))
     ///     .send()
     ///     .await?;
     /// # Ok(())
@@ -306,7 +317,7 @@ impl RequestBuilder {
     where
         F: FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
     {
-        self.inner = f(self.inner);
+        self.inner = self.inner.map(f);
         self
     }
 
@@ -315,12 +326,12 @@ impl RequestBuilder {
     /// The returned request carries no access token yet; pass it to
     /// [`HttpClient::execute`] to have one attached.
     pub fn build(self) -> Result<Request> {
-        Ok(self.inner.build()?)
+        Ok(self.inner?.build()?)
     }
 
     /// Sends the request with a valid access token attached.
     pub async fn send(self) -> Result<Response> {
-        let request = self.inner.build()?;
+        let request = self.inner?.build()?;
         self.http.execute(request).await
     }
 }
@@ -445,10 +456,7 @@ mod tests {
     async fn url_credentials_are_rejected_and_redacted() {
         let http = client().await.http();
 
-        // `RequestBuilder` moves URL credentials into an Authorization header,
-        // so a request carrying them has to be built directly.
-        let url = Url::parse("https://user:hunter2@example.com/").unwrap();
-        let request = Request::new(Method::GET, url);
+        let request = request(&http, "https://user:hunter2@example.com/");
 
         let err = http
             .authorize(&request)

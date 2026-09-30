@@ -570,6 +570,12 @@ pub mod workspace {
             /// and automated workloads where no human interaction is expected.
             #[prost(bool, tag = "12")]
             pub auto_stop: bool,
+            /// VolumeMounts is the list of the Volumes of the Workspace's Space that
+            /// are mounted inside the Workspace. The mounts that are defined by the
+            /// Template are merged with the ones that are defined by the Workspace
+            /// itself.
+            #[prost(message, repeated, tag = "13")]
+            pub volume_mounts: ::prost::alloc::vec::Vec<runtime::VolumeMount>,
         }
         /// Nested message and enum types in `Runtime`.
         pub mod runtime {
@@ -779,6 +785,40 @@ pub mod workspace {
                         .into()
                 }
             }
+            /// VolumeMount attaches a Volume of the Workspace's Space to a path
+            /// inside the Workspace's container.
+            #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+            pub struct VolumeMount {
+                /// VolumeRef is the reference of the mounted Volume. The Volume must
+                /// belong to the same Space as the Workspace.
+                #[prost(message, optional, tag = "1")]
+                pub volume_ref: ::core::option::Option<
+                    super::super::super::super::super::meta::v1::ObjectReference,
+                >,
+                /// MountPath is the absolute, canonical path inside the Workspace's
+                /// container at which the Volume is mounted (e.g. `/data`). It cannot
+                /// be the root directory, it cannot overlap with another mount and it
+                /// cannot cover the paths that are reserved by the Cluster.
+                #[prost(string, tag = "2")]
+                pub mount_path: ::prost::alloc::string::String,
+                /// ReadOnly mounts the Volume read-only inside this Workspace. It is
+                /// set per mount (i.e. the same Volume can simultaneously be mounted
+                /// read-write by a Workspace and read-only by another one).
+                #[prost(bool, tag = "3")]
+                pub read_only: bool,
+            }
+            impl ::prost::Name for VolumeMount {
+                const NAME: &'static str = "VolumeMount";
+                const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                fn full_name() -> ::prost::alloc::string::String {
+                    "octelium.api.main.cordium.v1.Workspace.Spec.Runtime.VolumeMount"
+                        .into()
+                }
+                fn type_url() -> ::prost::alloc::string::String {
+                    "type.googleapis.com/octelium.api.main.cordium.v1.Workspace.Spec.Runtime.VolumeMount"
+                        .into()
+                }
+            }
             /// Devcontainers is the Development Container-related configuration.
             #[derive(Clone, PartialEq, ::prost::Message)]
             pub struct Devcontainers {
@@ -882,17 +922,29 @@ pub mod workspace {
                 }
             }
             /// Network is the network-related configuration of the Workspace.
-            #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-            pub struct Network {}
+            #[derive(Clone, PartialEq, ::prost::Message)]
+            pub struct Network {
+                /// Egress is the egress (i.e. outbound) traffic configuration.
+                #[prost(message, optional, tag = "1")]
+                pub egress: ::core::option::Option<network::Egress>,
+            }
             /// Nested message and enum types in `Network`.
             pub mod network {
-                /// Rule is a network rule that matches a set of network ranges.
+                /// Rule is a network rule that matches a set of network ranges and
+                /// ports.
                 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
                 pub struct Rule {
                     /// CIDRs is the list of the network ranges, in CIDR notation, that
-                    /// are matched by the Rule.
+                    /// are matched by the Rule. At least one CIDR must be set.
                     #[prost(string, repeated, tag = "1")]
                     pub cidrs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+                    /// Action is the effect of the Rule when it matches. It must be set.
+                    #[prost(enumeration = "rule::Action", tag = "2")]
+                    pub action: i32,
+                    /// Ports is the list of the destination ports that are matched by the
+                    /// Rule. An empty list matches every port.
+                    #[prost(uint32, repeated, tag = "3")]
+                    pub ports: ::prost::alloc::vec::Vec<u32>,
                 }
                 /// Nested message and enum types in `Rule`.
                 pub mod rule {
@@ -910,7 +962,8 @@ pub mod workspace {
                     )]
                     #[repr(i32)]
                     pub enum Action {
-                        /// ACTION_UNSET falls back to the default action.
+                        /// ACTION_UNSET is not used. The action of a Rule must be
+                        /// explicitly set.
                         Unset = 0,
                         /// ALLOW allows the matched traffic.
                         Allow = 1,
@@ -954,15 +1007,70 @@ pub mod workspace {
                             .into()
                     }
                 }
-                /// Egress is the egress (i.e. outbound) traffic configuration.
+                /// Egress is the egress (i.e. outbound) traffic configuration of the
+                /// Workspace. The Rules are unordered. A destination that is matched by
+                /// a DENY Rule is denied even if it is also matched by an ALLOW Rule. A
+                /// destination that is matched by no Rule falls back to the
+                /// DefaultAction. The Cluster's own protected networks are always
+                /// denied regardless of the configuration.
                 #[derive(Clone, PartialEq, ::prost::Message)]
                 pub struct Egress {
-                    /// Rules is the list of the egress rules that are evaluated in order.
+                    /// Rules is the list of the egress rules.
                     #[prost(message, repeated, tag = "1")]
                     pub rules: ::prost::alloc::vec::Vec<Rule>,
                     /// DefaultAction is the action that is applied when no Rule matches.
-                    #[prost(enumeration = "rule::Action", tag = "2")]
+                    #[prost(enumeration = "egress::DefaultAction", tag = "2")]
                     pub default_action: i32,
+                }
+                /// Nested message and enum types in `Egress`.
+                pub mod egress {
+                    /// DefaultAction is the action that is applied when no Rule matches
+                    #[derive(
+                        Clone,
+                        Copy,
+                        Debug,
+                        PartialEq,
+                        Eq,
+                        Hash,
+                        PartialOrd,
+                        Ord,
+                        ::prost::Enumeration
+                    )]
+                    #[repr(i32)]
+                    pub enum DefaultAction {
+                        /// DEFAULT_ACTION_UNSET falls back to ALLOW_PUBLIC.
+                        Unset = 0,
+                        /// ALLOW_PUBLIC allows the traffic to the publicly routable
+                        /// networks and denies the traffic to the private ones.
+                        AllowPublic = 1,
+                        /// DENY denies all the traffic that is not matched by an ALLOW
+                        /// Rule.
+                        Deny = 2,
+                    }
+                    impl DefaultAction {
+                        /// String value of the enum field names used in the ProtoBuf definition.
+                        ///
+                        /// The values are not transformed in any way and thus are considered stable
+                        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+                        pub fn as_str_name(&self) -> &'static str {
+                            match self {
+                                Self::Unset => "DEFAULT_ACTION_UNSET",
+                                Self::AllowPublic => "ALLOW_PUBLIC",
+                                Self::Deny => "DENY",
+                            }
+                        }
+                        /// Creates an enum from field names used in the ProtoBuf definition.
+                        pub fn from_str_name(
+                            value: &str,
+                        ) -> ::core::option::Option<Self> {
+                            match value {
+                                "DEFAULT_ACTION_UNSET" => Some(Self::Unset),
+                                "ALLOW_PUBLIC" => Some(Self::AllowPublic),
+                                "DENY" => Some(Self::Deny),
+                                _ => None,
+                            }
+                        }
+                    }
                 }
                 impl ::prost::Name for Egress {
                     const NAME: &'static str = "Egress";
@@ -1375,6 +1483,21 @@ pub mod workspace {
         /// the most to the least recent one.
         #[prost(message, repeated, tag = "25")]
         pub last_runs: ::prost::alloc::vec::Vec<status::Run>,
+        /// WorkspaceSnapshotRef is the reference of the WorkspaceSnapshot that the
+        /// Workspace's persistent storage was restored from. It is set by the
+        /// Cluster upon the creation of the Workspace and it is immutable.
+        #[prost(message, optional, tag = "26")]
+        pub workspace_snapshot_ref: ::core::option::Option<
+            super::super::super::meta::v1::ObjectReference,
+        >,
+        /// LastRegionRef is the reference of the Region that hosted the latest run
+        /// of the Workspace. Unlike regionRef, which is unset once the Workspace is
+        /// stopped, it is preserved since the Workspace's persistent storage
+        /// remains in that Region.
+        #[prost(message, optional, tag = "27")]
+        pub last_region_ref: ::core::option::Option<
+            super::super::super::meta::v1::ObjectReference,
+        >,
     }
     /// Nested message and enum types in `Status`.
     pub mod status {
@@ -1387,7 +1510,7 @@ pub mod workspace {
             /// Type is the specific reason of the failure
             #[prost(
                 oneof = "failure::Type",
-                tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
+                tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17"
             )]
             pub r#type: ::core::option::Option<failure::Type>,
         }
@@ -1638,6 +1761,43 @@ pub mod workspace {
                         .into()
                 }
             }
+            /// NetworkPolicy means that the Workspace's network configuration could
+            /// not be enforced. The Workspace is not started in that case.
+            #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+            pub struct NetworkPolicy {}
+            impl ::prost::Name for NetworkPolicy {
+                const NAME: &'static str = "NetworkPolicy";
+                const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                fn full_name() -> ::prost::alloc::string::String {
+                    "octelium.api.main.cordium.v1.Workspace.Status.Failure.NetworkPolicy"
+                        .into()
+                }
+                fn type_url() -> ::prost::alloc::string::String {
+                    "type.googleapis.com/octelium.api.main.cordium.v1.Workspace.Status.Failure.NetworkPolicy"
+                        .into()
+                }
+            }
+            /// Volume means that one of the Volumes that are mounted by the
+            /// Workspace could not be resolved (e.g. it does not exist anymore, it
+            /// belongs to another Space or it is hosted in another Region). The
+            /// Workspace is not started in that case.
+            #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+            pub struct Volume {
+                /// Name is the name of the Volume that could not be resolved.
+                #[prost(string, tag = "1")]
+                pub name: ::prost::alloc::string::String,
+            }
+            impl ::prost::Name for Volume {
+                const NAME: &'static str = "Volume";
+                const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                fn full_name() -> ::prost::alloc::string::String {
+                    "octelium.api.main.cordium.v1.Workspace.Status.Failure.Volume".into()
+                }
+                fn type_url() -> ::prost::alloc::string::String {
+                    "type.googleapis.com/octelium.api.main.cordium.v1.Workspace.Status.Failure.Volume"
+                        .into()
+                }
+            }
             /// Type is the specific reason of the failure
             #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
             pub enum Type {
@@ -1688,6 +1848,13 @@ pub mod workspace {
                 /// repositories failed.
                 #[prost(message, tag = "15")]
                 AdditionalRepoClone(AdditionalRepoClone),
+                /// NetworkPolicy means that the Workspace's network configuration could
+                /// not be enforced.
+                #[prost(message, tag = "16")]
+                NetworkPolicy(NetworkPolicy),
+                /// Volume means that one of the mounted Volumes could not be resolved.
+                #[prost(message, tag = "17")]
+                Volume(Volume),
             }
         }
         impl ::prost::Name for Failure {
@@ -2025,6 +2192,762 @@ impl ::prost::Name for ListWorkspaceOptions {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "type.googleapis.com/octelium.api.main.cordium.v1.ListWorkspaceOptions".into()
+    }
+}
+/// WorkspaceSnapshot is a point-in-time checkpoint of the persistent storage of
+/// a Workspace. It is backed by a Kubernetes CSI volume snapshot of the
+/// Workspace's underlying volume and it is what enables a Workspace to be
+/// cloned into a brand new Workspace inside the same Space. A snapshot is taken
+/// online (i.e. without stopping the source Workspace) in which case it is a
+/// crash-consistent checkpoint, or while the source Workspace is stopped in
+/// which case it is a clean one. Snapshots are owned by the Octelium User who
+/// created them and they have a lifecycle of their own (i.e. they outlive both
+/// their source Workspace and the Workspaces that are restored from them).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkspaceSnapshot {
+    /// APIVersion is the API version (i.e. "cordium/v1")
+    #[prost(string, tag = "1")]
+    pub api_version: ::prost::alloc::string::String,
+    /// Kind is the resource name (i.e. `WorkspaceSnapshot`).
+    #[prost(string, tag = "2")]
+    pub kind: ::prost::alloc::string::String,
+    /// Metadata is the object's metadata.
+    #[prost(message, optional, tag = "3")]
+    pub metadata: ::core::option::Option<super::super::meta::v1::Metadata>,
+    /// Spec is the WorkspaceSnapshot specification.
+    #[prost(message, optional, tag = "4")]
+    pub spec: ::core::option::Option<workspace_snapshot::Spec>,
+    /// Status is the current status of the WorkspaceSnapshot.
+    #[prost(message, optional, tag = "5")]
+    pub status: ::core::option::Option<workspace_snapshot::Status>,
+}
+/// Nested message and enum types in `WorkspaceSnapshot`.
+pub mod workspace_snapshot {
+    /// Spec is the WorkspaceSnapshot specification. It is intentionally empty.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Spec {}
+    impl ::prost::Name for Spec {
+        const NAME: &'static str = "Spec";
+        const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+        fn full_name() -> ::prost::alloc::string::String {
+            "octelium.api.main.cordium.v1.WorkspaceSnapshot.Spec".into()
+        }
+        fn type_url() -> ::prost::alloc::string::String {
+            "type.googleapis.com/octelium.api.main.cordium.v1.WorkspaceSnapshot.Spec"
+                .into()
+        }
+    }
+    /// Status is the current status of the WorkspaceSnapshot. It is entirely
+    /// managed by the Cluster and it is read-only.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Status {
+        /// State is the current state of the WorkspaceSnapshot.
+        #[prost(enumeration = "status::State", tag = "1")]
+        pub state: i32,
+        /// WorkspaceRef is the reference of the Workspace that the snapshot was
+        /// taken from. It is kept even after that Workspace is deleted.
+        #[prost(message, optional, tag = "2")]
+        pub workspace_ref: ::core::option::Option<
+            super::super::super::meta::v1::ObjectReference,
+        >,
+        /// UserRef is the reference of the Octelium User who owns the snapshot.
+        #[prost(message, optional, tag = "3")]
+        pub user_ref: ::core::option::Option<
+            super::super::super::meta::v1::ObjectReference,
+        >,
+        /// SpaceRef is the reference of the Space of the source Workspace. New
+        /// Workspaces can only be restored from the snapshot inside that Space.
+        #[prost(message, optional, tag = "4")]
+        pub space_ref: ::core::option::Option<
+            super::super::super::meta::v1::ObjectReference,
+        >,
+        /// TemplateRef is the reference of the Template of the source Workspace.
+        #[prost(message, optional, tag = "5")]
+        pub template_ref: ::core::option::Option<
+            super::super::super::meta::v1::ObjectReference,
+        >,
+        /// RegionRef is the reference of the Region that holds the snapshot. It is
+        /// the Region that hosted the latest run of the source Workspace and it is
+        /// where the restored Workspaces are run.
+        #[prost(message, optional, tag = "6")]
+        pub region_ref: ::core::option::Option<
+            super::super::super::meta::v1::ObjectReference,
+        >,
+        /// SnapshotAt is the timestamp of the point-in-time cut as it is reported
+        /// by the storage backend. It is unset until the backend starts taking the
+        /// snapshot.
+        #[prost(message, optional, tag = "7")]
+        pub snapshot_at: ::core::option::Option<::prost_types::Timestamp>,
+        /// ReadyAt is the timestamp at which the snapshot became restorable.
+        #[prost(message, optional, tag = "8")]
+        pub ready_at: ::core::option::Option<::prost_types::Timestamp>,
+        /// RestoreSizeBytes is the minimum size, in bytes, of the volume that the
+        /// snapshot can be restored into. It is reported by the storage backend.
+        #[prost(uint64, tag = "9")]
+        pub restore_size_bytes: u64,
+        /// Consistency is the consistency guarantee of the snapshot.
+        #[prost(enumeration = "status::Consistency", tag = "10")]
+        pub consistency: i32,
+        /// Failure is the reason of the failure of the snapshot, if any.
+        #[prost(message, optional, tag = "11")]
+        pub failure: ::core::option::Option<status::Failure>,
+    }
+    /// Nested message and enum types in `Status`.
+    pub mod status {
+        /// Failure describes the reason of the failure of a snapshot.
+        #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+        pub struct Failure {
+            /// Message is a human-readable description of the failure.
+            #[prost(string, tag = "1")]
+            pub message: ::prost::alloc::string::String,
+            /// Type is the specific reason of the failure
+            #[prost(oneof = "failure::Type", tags = "2, 3, 4, 5")]
+            pub r#type: ::core::option::Option<failure::Type>,
+        }
+        /// Nested message and enum types in `Failure`.
+        pub mod failure {
+            /// Unsupported means that the Cluster is not able to snapshot the
+            /// Workspaces' storage (e.g. the CSI volume snapshot API is not installed
+            /// or no VolumeSnapshotClass is configured).
+            #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+            pub struct Unsupported {}
+            impl ::prost::Name for Unsupported {
+                const NAME: &'static str = "Unsupported";
+                const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                fn full_name() -> ::prost::alloc::string::String {
+                    "octelium.api.main.cordium.v1.WorkspaceSnapshot.Status.Failure.Unsupported"
+                        .into()
+                }
+                fn type_url() -> ::prost::alloc::string::String {
+                    "type.googleapis.com/octelium.api.main.cordium.v1.WorkspaceSnapshot.Status.Failure.Unsupported"
+                        .into()
+                }
+            }
+            /// SourceNotFound means that the Workspace's underlying volume does not
+            /// exist anymore.
+            #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+            pub struct SourceNotFound {}
+            impl ::prost::Name for SourceNotFound {
+                const NAME: &'static str = "SourceNotFound";
+                const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                fn full_name() -> ::prost::alloc::string::String {
+                    "octelium.api.main.cordium.v1.WorkspaceSnapshot.Status.Failure.SourceNotFound"
+                        .into()
+                }
+                fn type_url() -> ::prost::alloc::string::String {
+                    "type.googleapis.com/octelium.api.main.cordium.v1.WorkspaceSnapshot.Status.Failure.SourceNotFound"
+                        .into()
+                }
+            }
+            /// Storage means that the storage backend failed to take the snapshot.
+            #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+            pub struct Storage {}
+            impl ::prost::Name for Storage {
+                const NAME: &'static str = "Storage";
+                const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                fn full_name() -> ::prost::alloc::string::String {
+                    "octelium.api.main.cordium.v1.WorkspaceSnapshot.Status.Failure.Storage"
+                        .into()
+                }
+                fn type_url() -> ::prost::alloc::string::String {
+                    "type.googleapis.com/octelium.api.main.cordium.v1.WorkspaceSnapshot.Status.Failure.Storage"
+                        .into()
+                }
+            }
+            /// Unknown means that the snapshot failed for an unclassified reason.
+            #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+            pub struct Unknown {}
+            impl ::prost::Name for Unknown {
+                const NAME: &'static str = "Unknown";
+                const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                fn full_name() -> ::prost::alloc::string::String {
+                    "octelium.api.main.cordium.v1.WorkspaceSnapshot.Status.Failure.Unknown"
+                        .into()
+                }
+                fn type_url() -> ::prost::alloc::string::String {
+                    "type.googleapis.com/octelium.api.main.cordium.v1.WorkspaceSnapshot.Status.Failure.Unknown"
+                        .into()
+                }
+            }
+            /// Type is the specific reason of the failure
+            #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+            pub enum Type {
+                /// Unsupported means that the Cluster cannot snapshot the Workspaces'
+                /// storage.
+                #[prost(message, tag = "2")]
+                Unsupported(Unsupported),
+                /// SourceNotFound means that the Workspace's volume does not exist.
+                #[prost(message, tag = "3")]
+                SourceNotFound(SourceNotFound),
+                /// Storage means that the storage backend failed to take the snapshot.
+                #[prost(message, tag = "4")]
+                Storage(Storage),
+                /// Unknown means that the snapshot failed for an unclassified reason.
+                #[prost(message, tag = "5")]
+                Unknown(Unknown),
+            }
+        }
+        impl ::prost::Name for Failure {
+            const NAME: &'static str = "Failure";
+            const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+            fn full_name() -> ::prost::alloc::string::String {
+                "octelium.api.main.cordium.v1.WorkspaceSnapshot.Status.Failure".into()
+            }
+            fn type_url() -> ::prost::alloc::string::String {
+                "type.googleapis.com/octelium.api.main.cordium.v1.WorkspaceSnapshot.Status.Failure"
+                    .into()
+            }
+        }
+        /// State is the current state of the WorkspaceSnapshot's lifecycle
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            ::prost::Enumeration
+        )]
+        #[repr(i32)]
+        pub enum State {
+            /// STATE_UNKNOWN is not used.
+            Unknown = 0,
+            /// STATE_CREATING means that the storage backend is still taking the
+            /// snapshot. The snapshot cannot be restored from yet.
+            Creating = 1,
+            /// STATE_READY means that the snapshot is complete and that new
+            /// Workspaces can be restored from it.
+            Ready = 2,
+            /// STATE_FAILED means that the snapshot could not be taken. It can never
+            /// be restored from.
+            Failed = 3,
+        }
+        impl State {
+            /// String value of the enum field names used in the ProtoBuf definition.
+            ///
+            /// The values are not transformed in any way and thus are considered stable
+            /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+            pub fn as_str_name(&self) -> &'static str {
+                match self {
+                    Self::Unknown => "STATE_UNKNOWN",
+                    Self::Creating => "STATE_CREATING",
+                    Self::Ready => "STATE_READY",
+                    Self::Failed => "STATE_FAILED",
+                }
+            }
+            /// Creates an enum from field names used in the ProtoBuf definition.
+            pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+                match value {
+                    "STATE_UNKNOWN" => Some(Self::Unknown),
+                    "STATE_CREATING" => Some(Self::Creating),
+                    "STATE_READY" => Some(Self::Ready),
+                    "STATE_FAILED" => Some(Self::Failed),
+                    _ => None,
+                }
+            }
+        }
+        /// Consistency is the consistency guarantee of the snapshot
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            ::prost::Enumeration
+        )]
+        #[repr(i32)]
+        pub enum Consistency {
+            /// CONSISTENCY_UNSET is not used.
+            Unset = 0,
+            /// CONSISTENCY_CRASH means that the snapshot was taken while the source
+            /// Workspace was running. It is equivalent to the state of the storage
+            /// after a power loss (i.e. the data that was still buffered in memory is
+            /// not included).
+            Crash = 1,
+            /// CONSISTENCY_CLEAN means that the source Workspace was stopped when the
+            /// snapshot was taken.
+            Clean = 2,
+        }
+        impl Consistency {
+            /// String value of the enum field names used in the ProtoBuf definition.
+            ///
+            /// The values are not transformed in any way and thus are considered stable
+            /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+            pub fn as_str_name(&self) -> &'static str {
+                match self {
+                    Self::Unset => "CONSISTENCY_UNSET",
+                    Self::Crash => "CONSISTENCY_CRASH",
+                    Self::Clean => "CONSISTENCY_CLEAN",
+                }
+            }
+            /// Creates an enum from field names used in the ProtoBuf definition.
+            pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+                match value {
+                    "CONSISTENCY_UNSET" => Some(Self::Unset),
+                    "CONSISTENCY_CRASH" => Some(Self::Crash),
+                    "CONSISTENCY_CLEAN" => Some(Self::Clean),
+                    _ => None,
+                }
+            }
+        }
+    }
+    impl ::prost::Name for Status {
+        const NAME: &'static str = "Status";
+        const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+        fn full_name() -> ::prost::alloc::string::String {
+            "octelium.api.main.cordium.v1.WorkspaceSnapshot.Status".into()
+        }
+        fn type_url() -> ::prost::alloc::string::String {
+            "type.googleapis.com/octelium.api.main.cordium.v1.WorkspaceSnapshot.Status"
+                .into()
+        }
+    }
+}
+impl ::prost::Name for WorkspaceSnapshot {
+    const NAME: &'static str = "WorkspaceSnapshot";
+    const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "octelium.api.main.cordium.v1.WorkspaceSnapshot".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "type.googleapis.com/octelium.api.main.cordium.v1.WorkspaceSnapshot".into()
+    }
+}
+/// WorkspaceSnapshotList is the response of the ListWorkspaceSnapshot method.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkspaceSnapshotList {
+    /// APIVersion is the API version (i.e. "cordium/v1")
+    #[prost(string, tag = "1")]
+    pub api_version: ::prost::alloc::string::String,
+    /// Kind is the resource name (i.e. `WorkspaceSnapshotList`).
+    #[prost(string, tag = "2")]
+    pub kind: ::prost::alloc::string::String,
+    /// Items is the list of WorkspaceSnapshots.
+    #[prost(message, repeated, tag = "3")]
+    pub items: ::prost::alloc::vec::Vec<WorkspaceSnapshot>,
+    /// ListResponseMeta is common information about the list.
+    #[prost(message, optional, tag = "4")]
+    pub list_response_meta: ::core::option::Option<
+        super::super::meta::v1::ListResponseMeta,
+    >,
+}
+impl ::prost::Name for WorkspaceSnapshotList {
+    const NAME: &'static str = "WorkspaceSnapshotList";
+    const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "octelium.api.main.cordium.v1.WorkspaceSnapshotList".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "type.googleapis.com/octelium.api.main.cordium.v1.WorkspaceSnapshotList".into()
+    }
+}
+/// ListWorkspaceSnapshotOptions is the request of the ListWorkspaceSnapshot
+/// method. The returned WorkspaceSnapshots are always restricted to the ones
+/// that are owned by the calling User.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListWorkspaceSnapshotOptions {
+    /// Common is the pagination and ordering options that are common to all the
+    /// List methods.
+    #[prost(message, optional, tag = "1")]
+    pub common: ::core::option::Option<super::super::meta::v1::CommonListOptions>,
+    /// Filter optionally narrows down the returned WorkspaceSnapshots
+    #[prost(oneof = "list_workspace_snapshot_options::Filter", tags = "2, 3")]
+    pub filter: ::core::option::Option<list_workspace_snapshot_options::Filter>,
+}
+/// Nested message and enum types in `ListWorkspaceSnapshotOptions`.
+pub mod list_workspace_snapshot_options {
+    /// Filter optionally narrows down the returned WorkspaceSnapshots
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Filter {
+        /// WorkspaceRef returns only the snapshots of this Workspace.
+        #[prost(message, tag = "2")]
+        WorkspaceRef(super::super::super::meta::v1::ObjectReference),
+        /// SpaceRef returns only the snapshots whose source Workspace belongs to
+        /// this Space.
+        #[prost(message, tag = "3")]
+        SpaceRef(super::super::super::meta::v1::ObjectReference),
+    }
+}
+impl ::prost::Name for ListWorkspaceSnapshotOptions {
+    const NAME: &'static str = "ListWorkspaceSnapshotOptions";
+    const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "octelium.api.main.cordium.v1.ListWorkspaceSnapshotOptions".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "type.googleapis.com/octelium.api.main.cordium.v1.ListWorkspaceSnapshotOptions"
+            .into()
+    }
+}
+/// Volume is a persistent storage device that lives inside a Space and that is
+/// mounted by the Workspaces of that Space at arbitrary paths. Unlike the
+/// Workspace's own private storage, a Volume has a lifecycle of its own (i.e.
+/// it outlives the Workspaces that mount it), it is shared between the Members
+/// of its Space and it is never included in the WorkspaceSnapshots of the
+/// Workspaces that mount it. Volumes are backed by a Kubernetes persistent
+/// volume and, therefore, they belong to a single Region and can only be
+/// mounted by the Workspaces that run in that same Region.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Volume {
+    /// APIVersion is the API version (i.e. "cordium/v1")
+    #[prost(string, tag = "1")]
+    pub api_version: ::prost::alloc::string::String,
+    /// Kind is the resource name (i.e. `Volume`).
+    #[prost(string, tag = "2")]
+    pub kind: ::prost::alloc::string::String,
+    /// Metadata is the object's metadata.
+    #[prost(message, optional, tag = "3")]
+    pub metadata: ::core::option::Option<super::super::meta::v1::Metadata>,
+    /// Spec is the Volume specification.
+    #[prost(message, optional, tag = "4")]
+    pub spec: ::core::option::Option<volume::Spec>,
+    /// Status is the current status of the Volume.
+    #[prost(message, optional, tag = "5")]
+    pub status: ::core::option::Option<volume::Status>,
+}
+/// Nested message and enum types in `Volume`.
+pub mod volume {
+    /// Spec is the Volume specification
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Spec {
+        /// Size is the requested capacity of the Volume. It defaults to the
+        /// Cluster's default Volume size. It can later be grown but never shrunk
+        /// and growing it additionally requires the storage backend to support the
+        /// expansion of the already provisioned volumes.
+        #[prost(message, optional, tag = "1")]
+        pub size: ::core::option::Option<spec::Size>,
+        /// AccessMode is the concurrency guarantee of the Volume. It is immutable
+        /// and it defaults to EXCLUSIVE.
+        #[prost(enumeration = "AccessMode", tag = "2")]
+        pub access_mode: i32,
+    }
+    /// Nested message and enum types in `Spec`.
+    pub mod spec {
+        /// Size is the capacity of a Volume.
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+        pub struct Size {
+            /// Megabytes is the capacity in megabytes.
+            #[prost(uint32, tag = "1")]
+            pub megabytes: u32,
+        }
+        impl ::prost::Name for Size {
+            const NAME: &'static str = "Size";
+            const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+            fn full_name() -> ::prost::alloc::string::String {
+                "octelium.api.main.cordium.v1.Volume.Spec.Size".into()
+            }
+            fn type_url() -> ::prost::alloc::string::String {
+                "type.googleapis.com/octelium.api.main.cordium.v1.Volume.Spec.Size"
+                    .into()
+            }
+        }
+    }
+    impl ::prost::Name for Spec {
+        const NAME: &'static str = "Spec";
+        const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+        fn full_name() -> ::prost::alloc::string::String {
+            "octelium.api.main.cordium.v1.Volume.Spec".into()
+        }
+        fn type_url() -> ::prost::alloc::string::String {
+            "type.googleapis.com/octelium.api.main.cordium.v1.Volume.Spec".into()
+        }
+    }
+    /// Status is the current status of the Volume. It is entirely managed by the
+    /// Cluster and it is read-only.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+    pub struct Status {
+        /// State is the current state of the Volume.
+        #[prost(enumeration = "status::State", tag = "1")]
+        pub state: i32,
+        /// SpaceRef is the reference of the Space that owns the Volume.
+        #[prost(message, optional, tag = "2")]
+        pub space_ref: ::core::option::Option<
+            super::super::super::meta::v1::ObjectReference,
+        >,
+        /// UserRef is the reference of the Octelium User who created the Volume.
+        #[prost(message, optional, tag = "3")]
+        pub user_ref: ::core::option::Option<
+            super::super::super::meta::v1::ObjectReference,
+        >,
+        /// RegionRef is the reference of the Region that hosts the Volume's
+        /// underlying storage. Only the Workspaces that run in that Region can
+        /// mount the Volume.
+        #[prost(message, optional, tag = "4")]
+        pub region_ref: ::core::option::Option<
+            super::super::super::meta::v1::ObjectReference,
+        >,
+        /// Capacity is the actual capacity of the provisioned storage as it is
+        /// reported by the storage backend. It is unset until the Volume is
+        /// provisioned and it can be larger than the requested size.
+        #[prost(message, optional, tag = "5")]
+        pub capacity: ::core::option::Option<spec::Size>,
+        /// ReadyAt is the timestamp at which the Volume's storage was provisioned.
+        #[prost(message, optional, tag = "6")]
+        pub ready_at: ::core::option::Option<::prost_types::Timestamp>,
+        /// Failure is the reason of the failure of the Volume, if any.
+        #[prost(message, optional, tag = "7")]
+        pub failure: ::core::option::Option<status::Failure>,
+    }
+    /// Nested message and enum types in `Status`.
+    pub mod status {
+        /// Failure describes the reason of the failure of a Volume.
+        #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+        pub struct Failure {
+            /// Message is a human-readable description of the failure.
+            #[prost(string, tag = "1")]
+            pub message: ::prost::alloc::string::String,
+            /// Type is the specific reason of the failure
+            #[prost(oneof = "failure::Type", tags = "2, 3, 4")]
+            pub r#type: ::core::option::Option<failure::Type>,
+        }
+        /// Nested message and enum types in `Failure`.
+        pub mod failure {
+            /// Unsupported means that the Cluster is not able to provision the
+            /// Volume as it is requested (e.g. a SHARED Volume was requested while no
+            /// multi-writer storage backend is configured).
+            #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+            pub struct Unsupported {}
+            impl ::prost::Name for Unsupported {
+                const NAME: &'static str = "Unsupported";
+                const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                fn full_name() -> ::prost::alloc::string::String {
+                    "octelium.api.main.cordium.v1.Volume.Status.Failure.Unsupported"
+                        .into()
+                }
+                fn type_url() -> ::prost::alloc::string::String {
+                    "type.googleapis.com/octelium.api.main.cordium.v1.Volume.Status.Failure.Unsupported"
+                        .into()
+                }
+            }
+            /// Storage means that the storage backend failed to provision the Volume
+            /// or that the already provisioned storage was lost.
+            #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+            pub struct Storage {}
+            impl ::prost::Name for Storage {
+                const NAME: &'static str = "Storage";
+                const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                fn full_name() -> ::prost::alloc::string::String {
+                    "octelium.api.main.cordium.v1.Volume.Status.Failure.Storage".into()
+                }
+                fn type_url() -> ::prost::alloc::string::String {
+                    "type.googleapis.com/octelium.api.main.cordium.v1.Volume.Status.Failure.Storage"
+                        .into()
+                }
+            }
+            /// Unknown means that the Volume failed for an unclassified reason.
+            #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+            pub struct Unknown {}
+            impl ::prost::Name for Unknown {
+                const NAME: &'static str = "Unknown";
+                const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                fn full_name() -> ::prost::alloc::string::String {
+                    "octelium.api.main.cordium.v1.Volume.Status.Failure.Unknown".into()
+                }
+                fn type_url() -> ::prost::alloc::string::String {
+                    "type.googleapis.com/octelium.api.main.cordium.v1.Volume.Status.Failure.Unknown"
+                        .into()
+                }
+            }
+            /// Type is the specific reason of the failure
+            #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+            pub enum Type {
+                /// Unsupported means that the Cluster cannot provision the Volume as it
+                /// is requested.
+                #[prost(message, tag = "2")]
+                Unsupported(Unsupported),
+                /// Storage means that the storage backend failed.
+                #[prost(message, tag = "3")]
+                Storage(Storage),
+                /// Unknown means that the Volume failed for an unclassified reason.
+                #[prost(message, tag = "4")]
+                Unknown(Unknown),
+            }
+        }
+        impl ::prost::Name for Failure {
+            const NAME: &'static str = "Failure";
+            const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+            fn full_name() -> ::prost::alloc::string::String {
+                "octelium.api.main.cordium.v1.Volume.Status.Failure".into()
+            }
+            fn type_url() -> ::prost::alloc::string::String {
+                "type.googleapis.com/octelium.api.main.cordium.v1.Volume.Status.Failure"
+                    .into()
+            }
+        }
+        /// State is the current state of the Volume's lifecycle
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            ::prost::Enumeration
+        )]
+        #[repr(i32)]
+        pub enum State {
+            /// STATE_UNKNOWN is not used.
+            Unknown = 0,
+            /// STATE_PENDING means that the underlying storage is not provisioned
+            /// yet. A Volume can already be mounted by the Workspaces while it is
+            /// PENDING since the storage backends commonly defer the provisioning
+            /// itself until the first Workspace that mounts the Volume is scheduled.
+            Pending = 1,
+            /// STATE_READY means that the underlying storage is provisioned.
+            Ready = 2,
+            /// STATE_FAILED means that the underlying storage could not be
+            /// provisioned or that it was lost.
+            Failed = 3,
+        }
+        impl State {
+            /// String value of the enum field names used in the ProtoBuf definition.
+            ///
+            /// The values are not transformed in any way and thus are considered stable
+            /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+            pub fn as_str_name(&self) -> &'static str {
+                match self {
+                    Self::Unknown => "STATE_UNKNOWN",
+                    Self::Pending => "STATE_PENDING",
+                    Self::Ready => "STATE_READY",
+                    Self::Failed => "STATE_FAILED",
+                }
+            }
+            /// Creates an enum from field names used in the ProtoBuf definition.
+            pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+                match value {
+                    "STATE_UNKNOWN" => Some(Self::Unknown),
+                    "STATE_PENDING" => Some(Self::Pending),
+                    "STATE_READY" => Some(Self::Ready),
+                    "STATE_FAILED" => Some(Self::Failed),
+                    _ => None,
+                }
+            }
+        }
+    }
+    impl ::prost::Name for Status {
+        const NAME: &'static str = "Status";
+        const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+        fn full_name() -> ::prost::alloc::string::String {
+            "octelium.api.main.cordium.v1.Volume.Status".into()
+        }
+        fn type_url() -> ::prost::alloc::string::String {
+            "type.googleapis.com/octelium.api.main.cordium.v1.Volume.Status".into()
+        }
+    }
+    /// AccessMode is the concurrency guarantee of a Volume
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        Hash,
+        PartialOrd,
+        Ord,
+        ::prost::Enumeration
+    )]
+    #[repr(i32)]
+    pub enum AccessMode {
+        /// ACCESS_MODE_UNSET falls back to EXCLUSIVE.
+        Unset = 0,
+        /// ACCESS_MODE_EXCLUSIVE is a Volume that is meant to be actively mounted
+        /// by a single Workspace at a time. It is backed by a single-writer
+        /// Kubernetes volume which is what the block storage backends typically
+        /// provide.
+        Exclusive = 1,
+        /// ACCESS_MODE_SHARED is a Volume that can be actively mounted by several
+        /// Workspaces at the same time. It is backed by a multi-writer Kubernetes
+        /// volume and, therefore, it requires the Cluster to be configured with a
+        /// shared filesystem storage backend (e.g. NFS, CephFS or EFS).
+        Shared = 2,
+    }
+    impl AccessMode {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unset => "ACCESS_MODE_UNSET",
+                Self::Exclusive => "ACCESS_MODE_EXCLUSIVE",
+                Self::Shared => "ACCESS_MODE_SHARED",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "ACCESS_MODE_UNSET" => Some(Self::Unset),
+                "ACCESS_MODE_EXCLUSIVE" => Some(Self::Exclusive),
+                "ACCESS_MODE_SHARED" => Some(Self::Shared),
+                _ => None,
+            }
+        }
+    }
+}
+impl ::prost::Name for Volume {
+    const NAME: &'static str = "Volume";
+    const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "octelium.api.main.cordium.v1.Volume".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "type.googleapis.com/octelium.api.main.cordium.v1.Volume".into()
+    }
+}
+/// VolumeList is the response of the ListVolume method.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VolumeList {
+    /// APIVersion is the API version (i.e. "cordium/v1")
+    #[prost(string, tag = "1")]
+    pub api_version: ::prost::alloc::string::String,
+    /// Kind is the resource name (i.e. `VolumeList`).
+    #[prost(string, tag = "2")]
+    pub kind: ::prost::alloc::string::String,
+    /// Items is the list of Volumes.
+    #[prost(message, repeated, tag = "3")]
+    pub items: ::prost::alloc::vec::Vec<Volume>,
+    /// ListResponseMeta is common information about the list.
+    #[prost(message, optional, tag = "4")]
+    pub list_response_meta: ::core::option::Option<
+        super::super::meta::v1::ListResponseMeta,
+    >,
+}
+impl ::prost::Name for VolumeList {
+    const NAME: &'static str = "VolumeList";
+    const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "octelium.api.main.cordium.v1.VolumeList".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "type.googleapis.com/octelium.api.main.cordium.v1.VolumeList".into()
+    }
+}
+/// ListVolumeOptions is the request of the ListVolume method.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListVolumeOptions {
+    /// Common is the pagination and ordering options that are common to all the
+    /// List methods.
+    #[prost(message, optional, tag = "1")]
+    pub common: ::core::option::Option<super::super::meta::v1::CommonListOptions>,
+    /// SpaceRef is the reference of the Space whose Volumes are listed.
+    #[prost(message, optional, tag = "2")]
+    pub space_ref: ::core::option::Option<super::super::meta::v1::ObjectReference>,
+}
+impl ::prost::Name for ListVolumeOptions {
+    const NAME: &'static str = "ListVolumeOptions";
+    const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "octelium.api.main.cordium.v1.ListVolumeOptions".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "type.googleapis.com/octelium.api.main.cordium.v1.ListVolumeOptions".into()
     }
 }
 /// Secret is a sensitive value (e.g. an API key, a token, a password or a
@@ -5321,6 +6244,9 @@ pub mod cluster_config {
         /// Workspace is the Cluster-wide Workspace-related configuration.
         #[prost(message, optional, tag = "2")]
         pub workspace: ::core::option::Option<spec::Workspace>,
+        /// Volume is the Cluster-wide Volume-related configuration.
+        #[prost(message, optional, tag = "3")]
+        pub volume: ::core::option::Option<spec::Volume>,
     }
     /// Nested message and enum types in `Spec`.
     pub mod spec {
@@ -5473,8 +6399,9 @@ pub mod cluster_config {
                 #[prost(message, optional, tag = "1")]
                 pub storage_class: ::core::option::Option<storage::StorageClass>,
                 /// VolumeSnapshotClass selects the VolumeSnapshotClass of the Template
-                /// pre-build snapshots. If it is unset or if no rule matches, the
-                /// Template pre-builds are disabled.
+                /// pre-build snapshots and of the WorkspaceSnapshots. If it is unset or
+                /// if no rule matches, the Cluster lets Kubernetes pick the default
+                /// VolumeSnapshotClass of the volume's CSI driver instead.
                 #[prost(message, optional, tag = "2")]
                 pub volume_snapshot_class: ::core::option::Option<
                     storage::VolumeSnapshotClass,
@@ -5533,7 +6460,8 @@ pub mod cluster_config {
                     }
                 }
                 /// VolumeSnapshotClass selects the Kubernetes VolumeSnapshotClass that
-                /// is used for the Template pre-build snapshots.
+                /// is used for the Template pre-build snapshots as well as for the
+                /// WorkspaceSnapshots.
                 #[derive(Clone, PartialEq, ::prost::Message)]
                 pub struct VolumeSnapshotClass {
                     /// Rules is the list of the volume snapshot class selection rules.
@@ -5547,8 +6475,8 @@ pub mod cluster_config {
                     #[derive(Clone, PartialEq, ::prost::Message)]
                     pub struct Rule {
                         /// Condition is evaluated against the request context which
-                        /// contains the build Workspace (i.e. `ctx.workspace`) and its
-                        /// Template (i.e. `ctx.template`).
+                        /// contains the snapshotted Workspace (i.e. `ctx.workspace`) and
+                        /// its Template (i.e. `ctx.template`).
                         #[prost(message, optional, tag = "1")]
                         pub condition: ::core::option::Option<
                             super::super::super::super::super::Condition,
@@ -5632,6 +6560,10 @@ pub mod cluster_config {
                 pub max_limit: ::core::option::Option<
                     super::super::super::workspace::spec::Limit,
                 >,
+                /// MaxSnapshotsPerUser is the maximum total number of the
+                /// WorkspaceSnapshots that a single User can own.
+                #[prost(uint32, tag = "7")]
+                pub max_snapshots_per_user: u32,
             }
             impl ::prost::Name for Limit {
                 const NAME: &'static str = "Limit";
@@ -5721,6 +6653,144 @@ pub mod cluster_config {
             }
             fn type_url() -> ::prost::alloc::string::String {
                 "type.googleapis.com/octelium.api.main.cordium.v1.ClusterConfig.Spec.Workspace"
+                    .into()
+            }
+        }
+        /// Volume is the Cluster-wide Volume-related configuration.
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub struct Volume {
+            /// Storage is the storage provisioning configuration of the Volumes.
+            #[prost(message, optional, tag = "1")]
+            pub storage: ::core::option::Option<volume::Storage>,
+            /// Limit is the Cluster-wide Volume limits.
+            #[prost(message, optional, tag = "2")]
+            pub limit: ::core::option::Option<volume::Limit>,
+        }
+        /// Nested message and enum types in `Volume`.
+        pub mod volume {
+            /// Storage is the storage provisioning configuration of the Volumes.
+            #[derive(Clone, PartialEq, ::prost::Message)]
+            pub struct Storage {
+                /// StorageClass selects the StorageClass of the Volumes. If it is unset
+                /// or if no rule matches, the Cluster lets Kubernetes pick its default
+                /// StorageClass instead.
+                #[prost(message, optional, tag = "1")]
+                pub storage_class: ::core::option::Option<storage::StorageClass>,
+            }
+            /// Nested message and enum types in `Storage`.
+            pub mod storage {
+                /// StorageClass selects the Kubernetes StorageClass that is used to
+                /// provision the Volumes. Since the Kubernetes API does not expose
+                /// whether a StorageClass is able to provide multi-writer volumes, the
+                /// rules are what tells the Cluster which backend to use for the SHARED
+                /// Volumes and which one to use for the EXCLUSIVE ones.
+                #[derive(Clone, PartialEq, ::prost::Message)]
+                pub struct StorageClass {
+                    /// Rules is the list of the storage class selection rules. They are
+                    /// evaluated in order and the first matching one is used.
+                    #[prost(message, repeated, tag = "1")]
+                    pub rules: ::prost::alloc::vec::Vec<storage_class::Rule>,
+                }
+                /// Nested message and enum types in `StorageClass`.
+                pub mod storage_class {
+                    /// Rule is a single storage class selection rule.
+                    #[derive(Clone, PartialEq, ::prost::Message)]
+                    pub struct Rule {
+                        /// Condition is evaluated against the request context which
+                        /// contains the Volume that is being provisioned (i.e.
+                        /// `ctx.volume`).
+                        #[prost(message, optional, tag = "1")]
+                        pub condition: ::core::option::Option<
+                            super::super::super::super::super::Condition,
+                        >,
+                        /// StorageClass is the name of the Kubernetes StorageClass that is
+                        /// used once the Condition matches.
+                        #[prost(string, tag = "2")]
+                        pub storage_class: ::prost::alloc::string::String,
+                    }
+                    impl ::prost::Name for Rule {
+                        const NAME: &'static str = "Rule";
+                        const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                        fn full_name() -> ::prost::alloc::string::String {
+                            "octelium.api.main.cordium.v1.ClusterConfig.Spec.Volume.Storage.StorageClass.Rule"
+                                .into()
+                        }
+                        fn type_url() -> ::prost::alloc::string::String {
+                            "type.googleapis.com/octelium.api.main.cordium.v1.ClusterConfig.Spec.Volume.Storage.StorageClass.Rule"
+                                .into()
+                        }
+                    }
+                }
+                impl ::prost::Name for StorageClass {
+                    const NAME: &'static str = "StorageClass";
+                    const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                    fn full_name() -> ::prost::alloc::string::String {
+                        "octelium.api.main.cordium.v1.ClusterConfig.Spec.Volume.Storage.StorageClass"
+                            .into()
+                    }
+                    fn type_url() -> ::prost::alloc::string::String {
+                        "type.googleapis.com/octelium.api.main.cordium.v1.ClusterConfig.Spec.Volume.Storage.StorageClass"
+                            .into()
+                    }
+                }
+            }
+            impl ::prost::Name for Storage {
+                const NAME: &'static str = "Storage";
+                const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                fn full_name() -> ::prost::alloc::string::String {
+                    "octelium.api.main.cordium.v1.ClusterConfig.Spec.Volume.Storage"
+                        .into()
+                }
+                fn type_url() -> ::prost::alloc::string::String {
+                    "type.googleapis.com/octelium.api.main.cordium.v1.ClusterConfig.Spec.Volume.Storage"
+                        .into()
+                }
+            }
+            /// Limit is the Cluster-wide Volume limits. All the fields are optional
+            /// and omitting one means that no Cluster-level restriction is applied
+            /// for that dimension.
+            #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+            pub struct Limit {
+                /// MaxPerSpace is the maximum total number of the Volumes that a single
+                /// Space can own.
+                #[prost(uint32, tag = "1")]
+                pub max_per_space: u32,
+                /// MaxSize is a hard cap that no Volume of the Cluster can exceed.
+                #[prost(message, optional, tag = "2")]
+                pub max_size: ::core::option::Option<
+                    super::super::super::volume::spec::Size,
+                >,
+                /// DefaultSize is the size of the Volumes that do not request an
+                /// explicit one.
+                #[prost(message, optional, tag = "3")]
+                pub default_size: ::core::option::Option<
+                    super::super::super::volume::spec::Size,
+                >,
+                /// MaxMountsPerWorkspace is the maximum number of the Volumes that a
+                /// single Workspace can mount.
+                #[prost(uint32, tag = "4")]
+                pub max_mounts_per_workspace: u32,
+            }
+            impl ::prost::Name for Limit {
+                const NAME: &'static str = "Limit";
+                const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+                fn full_name() -> ::prost::alloc::string::String {
+                    "octelium.api.main.cordium.v1.ClusterConfig.Spec.Volume.Limit".into()
+                }
+                fn type_url() -> ::prost::alloc::string::String {
+                    "type.googleapis.com/octelium.api.main.cordium.v1.ClusterConfig.Spec.Volume.Limit"
+                        .into()
+                }
+            }
+        }
+        impl ::prost::Name for Volume {
+            const NAME: &'static str = "Volume";
+            const PACKAGE: &'static str = "octelium.api.main.cordium.v1";
+            fn full_name() -> ::prost::alloc::string::String {
+                "octelium.api.main.cordium.v1.ClusterConfig.Spec.Volume".into()
+            }
+            fn type_url() -> ::prost::alloc::string::String {
+                "type.googleapis.com/octelium.api.main.cordium.v1.ClusterConfig.Spec.Volume"
                     .into()
             }
         }
@@ -6719,6 +7789,281 @@ pub mod main_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// CreateWorkspaceSnapshot creates a WorkspaceSnapshot out of the persistent
+        /// storage of a Workspace owned by the User. The Workspace is neither stopped
+        /// nor restarted and it remains fully usable while the snapshot is being
+        /// taken. The snapshot is created in the CREATING state and the snapshotting
+        /// itself is asynchronous.
+        pub async fn create_workspace_snapshot(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WorkspaceSnapshot>,
+        ) -> std::result::Result<
+            tonic::Response<super::WorkspaceSnapshot>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/octelium.api.main.cordium.v1.MainService/CreateWorkspaceSnapshot",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "octelium.api.main.cordium.v1.MainService",
+                        "CreateWorkspaceSnapshot",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// DeleteWorkspaceSnapshot deletes a WorkspaceSnapshot owned by the User
+        /// together with its underlying storage snapshot.
+        pub async fn delete_workspace_snapshot(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::super::super::meta::v1::DeleteOptions,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::super::super::meta::v1::OperationResult>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/octelium.api.main.cordium.v1.MainService/DeleteWorkspaceSnapshot",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "octelium.api.main.cordium.v1.MainService",
+                        "DeleteWorkspaceSnapshot",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// ListWorkspaceSnapshot lists the WorkspaceSnapshots owned by the User.
+        pub async fn list_workspace_snapshot(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListWorkspaceSnapshotOptions>,
+        ) -> std::result::Result<
+            tonic::Response<super::WorkspaceSnapshotList>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/octelium.api.main.cordium.v1.MainService/ListWorkspaceSnapshot",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "octelium.api.main.cordium.v1.MainService",
+                        "ListWorkspaceSnapshot",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// GetWorkspaceSnapshot retrieves a specific WorkspaceSnapshot owned by the
+        /// User.
+        pub async fn get_workspace_snapshot(
+            &mut self,
+            request: impl tonic::IntoRequest<super::super::super::meta::v1::GetOptions>,
+        ) -> std::result::Result<
+            tonic::Response<super::WorkspaceSnapshot>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/octelium.api.main.cordium.v1.MainService/GetWorkspaceSnapshot",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "octelium.api.main.cordium.v1.MainService",
+                        "GetWorkspaceSnapshot",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// CreateVolume creates a Volume inside a Space. Volumes are provisioned
+        /// asynchronously and they can be mounted by the Workspaces of the Space
+        /// while they are still being provisioned.
+        pub async fn create_volume(
+            &mut self,
+            request: impl tonic::IntoRequest<super::Volume>,
+        ) -> std::result::Result<tonic::Response<super::Volume>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/octelium.api.main.cordium.v1.MainService/CreateVolume",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "octelium.api.main.cordium.v1.MainService",
+                        "CreateVolume",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// UpdateVolume updates a Volume. Only growing the Volume's size is
+        /// supported and it additionally requires the underlying storage backend to
+        /// support the expansion of the already provisioned volumes.
+        pub async fn update_volume(
+            &mut self,
+            request: impl tonic::IntoRequest<super::Volume>,
+        ) -> std::result::Result<tonic::Response<super::Volume>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/octelium.api.main.cordium.v1.MainService/UpdateVolume",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "octelium.api.main.cordium.v1.MainService",
+                        "UpdateVolume",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// DeleteVolume deletes a Volume together with its underlying storage. It is
+        /// rejected while the Volume is still mounted by a Workspace or a Template of
+        /// the Space regardless of whether those Workspaces are running.
+        pub async fn delete_volume(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::super::super::meta::v1::DeleteOptions,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::super::super::meta::v1::OperationResult>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/octelium.api.main.cordium.v1.MainService/DeleteVolume",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "octelium.api.main.cordium.v1.MainService",
+                        "DeleteVolume",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// ListVolume lists the Volumes of a Space that the User is a Member of.
+        pub async fn list_volume(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListVolumeOptions>,
+        ) -> std::result::Result<tonic::Response<super::VolumeList>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/octelium.api.main.cordium.v1.MainService/ListVolume",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "octelium.api.main.cordium.v1.MainService",
+                        "ListVolume",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// GetVolume retrieves a specific Volume of a Space that the User is a Member
+        /// of.
+        pub async fn get_volume(
+            &mut self,
+            request: impl tonic::IntoRequest<super::super::super::meta::v1::GetOptions>,
+        ) -> std::result::Result<tonic::Response<super::Volume>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/octelium.api.main.cordium.v1.MainService/GetVolume",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "octelium.api.main.cordium.v1.MainService",
+                        "GetVolume",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// StartWorkspace starts a stopped Workspace. The Cluster creates a dedicated
         /// Octelium Session for the run and moves the Workspace to the INIT_REQUEST
         /// state. The actual initialization is asynchronous and can be followed via
@@ -7614,6 +8959,97 @@ pub mod main_service_server {
             &self,
             request: tonic::Request<super::ListWorkspaceOptions>,
         ) -> std::result::Result<tonic::Response<super::WorkspaceList>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
+        /// CreateWorkspaceSnapshot creates a WorkspaceSnapshot out of the persistent
+        /// storage of a Workspace owned by the User. The Workspace is neither stopped
+        /// nor restarted and it remains fully usable while the snapshot is being
+        /// taken. The snapshot is created in the CREATING state and the snapshotting
+        /// itself is asynchronous.
+        async fn create_workspace_snapshot(
+            &self,
+            request: tonic::Request<super::WorkspaceSnapshot>,
+        ) -> std::result::Result<
+            tonic::Response<super::WorkspaceSnapshot>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
+        /// DeleteWorkspaceSnapshot deletes a WorkspaceSnapshot owned by the User
+        /// together with its underlying storage snapshot.
+        async fn delete_workspace_snapshot(
+            &self,
+            request: tonic::Request<super::super::super::meta::v1::DeleteOptions>,
+        ) -> std::result::Result<
+            tonic::Response<super::super::super::meta::v1::OperationResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
+        /// ListWorkspaceSnapshot lists the WorkspaceSnapshots owned by the User.
+        async fn list_workspace_snapshot(
+            &self,
+            request: tonic::Request<super::ListWorkspaceSnapshotOptions>,
+        ) -> std::result::Result<
+            tonic::Response<super::WorkspaceSnapshotList>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
+        /// GetWorkspaceSnapshot retrieves a specific WorkspaceSnapshot owned by the
+        /// User.
+        async fn get_workspace_snapshot(
+            &self,
+            request: tonic::Request<super::super::super::meta::v1::GetOptions>,
+        ) -> std::result::Result<
+            tonic::Response<super::WorkspaceSnapshot>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
+        /// CreateVolume creates a Volume inside a Space. Volumes are provisioned
+        /// asynchronously and they can be mounted by the Workspaces of the Space
+        /// while they are still being provisioned.
+        async fn create_volume(
+            &self,
+            request: tonic::Request<super::Volume>,
+        ) -> std::result::Result<tonic::Response<super::Volume>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
+        /// UpdateVolume updates a Volume. Only growing the Volume's size is
+        /// supported and it additionally requires the underlying storage backend to
+        /// support the expansion of the already provisioned volumes.
+        async fn update_volume(
+            &self,
+            request: tonic::Request<super::Volume>,
+        ) -> std::result::Result<tonic::Response<super::Volume>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
+        /// DeleteVolume deletes a Volume together with its underlying storage. It is
+        /// rejected while the Volume is still mounted by a Workspace or a Template of
+        /// the Space regardless of whether those Workspaces are running.
+        async fn delete_volume(
+            &self,
+            request: tonic::Request<super::super::super::meta::v1::DeleteOptions>,
+        ) -> std::result::Result<
+            tonic::Response<super::super::super::meta::v1::OperationResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
+        /// ListVolume lists the Volumes of a Space that the User is a Member of.
+        async fn list_volume(
+            &self,
+            request: tonic::Request<super::ListVolumeOptions>,
+        ) -> std::result::Result<tonic::Response<super::VolumeList>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
+        /// GetVolume retrieves a specific Volume of a Space that the User is a Member
+        /// of.
+        async fn get_volume(
+            &self,
+            request: tonic::Request<super::super::super::meta::v1::GetOptions>,
+        ) -> std::result::Result<tonic::Response<super::Volume>, tonic::Status> {
             Err(tonic::Status::unimplemented("Not yet implemented"))
         }
         /// StartWorkspace starts a stopped Workspace. The Cluster creates a dedicated
@@ -8935,6 +10371,429 @@ pub mod main_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ListWorkspaceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/octelium.api.main.cordium.v1.MainService/CreateWorkspaceSnapshot" => {
+                    #[allow(non_camel_case_types)]
+                    struct CreateWorkspaceSnapshotSvc<T: MainService>(pub Arc<T>);
+                    impl<
+                        T: MainService,
+                    > tonic::server::UnaryService<super::WorkspaceSnapshot>
+                    for CreateWorkspaceSnapshotSvc<T> {
+                        type Response = super::WorkspaceSnapshot;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WorkspaceSnapshot>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MainService>::create_workspace_snapshot(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CreateWorkspaceSnapshotSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/octelium.api.main.cordium.v1.MainService/DeleteWorkspaceSnapshot" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteWorkspaceSnapshotSvc<T: MainService>(pub Arc<T>);
+                    impl<
+                        T: MainService,
+                    > tonic::server::UnaryService<
+                        super::super::super::meta::v1::DeleteOptions,
+                    > for DeleteWorkspaceSnapshotSvc<T> {
+                        type Response = super::super::super::meta::v1::OperationResult;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::super::super::meta::v1::DeleteOptions,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MainService>::delete_workspace_snapshot(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteWorkspaceSnapshotSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/octelium.api.main.cordium.v1.MainService/ListWorkspaceSnapshot" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListWorkspaceSnapshotSvc<T: MainService>(pub Arc<T>);
+                    impl<
+                        T: MainService,
+                    > tonic::server::UnaryService<super::ListWorkspaceSnapshotOptions>
+                    for ListWorkspaceSnapshotSvc<T> {
+                        type Response = super::WorkspaceSnapshotList;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListWorkspaceSnapshotOptions>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MainService>::list_workspace_snapshot(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListWorkspaceSnapshotSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/octelium.api.main.cordium.v1.MainService/GetWorkspaceSnapshot" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetWorkspaceSnapshotSvc<T: MainService>(pub Arc<T>);
+                    impl<
+                        T: MainService,
+                    > tonic::server::UnaryService<
+                        super::super::super::meta::v1::GetOptions,
+                    > for GetWorkspaceSnapshotSvc<T> {
+                        type Response = super::WorkspaceSnapshot;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::super::super::meta::v1::GetOptions,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MainService>::get_workspace_snapshot(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetWorkspaceSnapshotSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/octelium.api.main.cordium.v1.MainService/CreateVolume" => {
+                    #[allow(non_camel_case_types)]
+                    struct CreateVolumeSvc<T: MainService>(pub Arc<T>);
+                    impl<T: MainService> tonic::server::UnaryService<super::Volume>
+                    for CreateVolumeSvc<T> {
+                        type Response = super::Volume;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::Volume>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MainService>::create_volume(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CreateVolumeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/octelium.api.main.cordium.v1.MainService/UpdateVolume" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpdateVolumeSvc<T: MainService>(pub Arc<T>);
+                    impl<T: MainService> tonic::server::UnaryService<super::Volume>
+                    for UpdateVolumeSvc<T> {
+                        type Response = super::Volume;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::Volume>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MainService>::update_volume(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UpdateVolumeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/octelium.api.main.cordium.v1.MainService/DeleteVolume" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteVolumeSvc<T: MainService>(pub Arc<T>);
+                    impl<
+                        T: MainService,
+                    > tonic::server::UnaryService<
+                        super::super::super::meta::v1::DeleteOptions,
+                    > for DeleteVolumeSvc<T> {
+                        type Response = super::super::super::meta::v1::OperationResult;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::super::super::meta::v1::DeleteOptions,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MainService>::delete_volume(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteVolumeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/octelium.api.main.cordium.v1.MainService/ListVolume" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListVolumeSvc<T: MainService>(pub Arc<T>);
+                    impl<
+                        T: MainService,
+                    > tonic::server::UnaryService<super::ListVolumeOptions>
+                    for ListVolumeSvc<T> {
+                        type Response = super::VolumeList;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListVolumeOptions>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MainService>::list_volume(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListVolumeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/octelium.api.main.cordium.v1.MainService/GetVolume" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetVolumeSvc<T: MainService>(pub Arc<T>);
+                    impl<
+                        T: MainService,
+                    > tonic::server::UnaryService<
+                        super::super::super::meta::v1::GetOptions,
+                    > for GetVolumeSvc<T> {
+                        type Response = super::Volume;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::super::super::meta::v1::GetOptions,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as MainService>::get_volume(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetVolumeSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

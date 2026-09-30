@@ -1,0 +1,48 @@
+[package]
+name = "cordium"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/cordium"
+description = "An ergonomic async Rust SDK for Cordium workspaces, execution, terminals, and storage"
+readme = "README.md"
+keywords = ["cordium", "sandbox", "sdk", "workspace", "async"]
+categories = ["api-bindings", "development-tools", "asynchronous"]
+include = ["src/**/*", "examples/**/*", "tests/**/*", "README.md", "LICENSE", "Cargo.toml"]
+
+[features]
+default = ["http", "tls-native-roots"]
+http = ["octelium/http"]
+tls-native-roots = ["octelium/tls-native-roots"]
+tls-webpki-roots = ["octelium/tls-webpki-roots"]
+
+[dependencies]
+octelium = { version = "0.1.1", path = "../octelium", default-features = false }
+octelium-apis = { workspace = true, features = ["client", "channel"] }
+async-stream = "0.3"
+base64 = "0.22"
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "sync", "time", "rt"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+tempfile = "3"
+tonic = { version = "0.14", default-features = false, features = ["codegen", "channel"] }
+
+[dev-dependencies]
+octelium-apis = { workspace = true, features = ["client", "channel", "server"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "process", "io-std"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["router", "server"] }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[example]]
+name = "http_application"
+required-features = ["http"]

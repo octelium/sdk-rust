@@ -29,7 +29,7 @@ with open(manifest) as f:
 
 updated, count = re.subn(
     r'(octelium-apis = \{ version = ")[^"]*(")',
-    lambda m: f"{m.group(1)}{version}{m.group(2)}",
+    lambda m: f"{m.group(1)}={version}{m.group(2)}",
     content,
 )
 
