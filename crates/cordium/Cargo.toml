@@ -1,6 +1,6 @@
 [package]
 name = "cordium"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version.workspace = true
 license.workspace = true
@@ -20,7 +20,7 @@ tls-native-roots = ["octelium/tls-native-roots"]
 tls-webpki-roots = ["octelium/tls-webpki-roots"]
 
 [dependencies]
-octelium = { version = "0.1.1", path = "../octelium", default-features = false }
+octelium = { version = "0.2.0", path = "../octelium", default-features = false }
 octelium-apis = { workspace = true, features = ["client", "channel"] }
 async-stream = "0.3"
 base64 = "0.22"

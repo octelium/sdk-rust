@@ -1,6 +1,6 @@
 [package]
 name = "octelium"
-version = "0.1.1"
+version = "0.2.0"
 description = "The official Rust SDK for Octelium: authenticated gRPC and HTTP clients for Octelium Clusters"
 readme = "README.md"
 documentation = "https://docs.rs/octelium"
