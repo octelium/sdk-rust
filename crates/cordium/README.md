@@ -7,18 +7,18 @@ edition; minimum supported Rust version (MSRV) **1.88**.
 
 ## Installation
 
-During local development, use the crate from this checkout:
+Add the crate from crates.io:
 
 ```toml
 [dependencies]
-cordium = { path = "/path/to/sdk-rust/crates/cordium" }
+cordium = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures-util = "0.3" # for StreamExt
 ```
 
-The crate is prepared for a `cordium = "0.1"` dependency after release. This
-checkout does not publish it. Generated protobuf files are included: applications
-need neither `protoc` nor the protobuf source repository to compile.
+For local development, use `cordium = { path = "/path/to/sdk-rust/crates/cordium" }`.
+Generated protobuf files are included: applications need neither `protoc` nor the
+protobuf source repository to compile.
 
 ## A usable workspace in one call
 
@@ -384,6 +384,6 @@ processes on loopback, including binary transfers and authentication cancellatio
 A real cluster smoke test remains a release check; local tests do not verify a
 particular cluster's policies, storage backend, or deployment.
 
-Release dependency order: `octelium-apis` 0.1.4, `octelium` 0.1.1, then `cordium`
-0.1.0. Packaging all workspace crates together verifies the local dependency
+Release dependency order: `octelium-apis` 0.1.4, `octelium` 0.2.0, then `cordium`
+0.2.0. Packaging all workspace crates together verifies the local dependency
 chain. Nothing is committed or published by the development commands above.
