@@ -54,8 +54,16 @@ export OCTELIUM_DOMAIN=example.com
 export OCTELIUM_AUTH_TOKEN=...
 
 cargo run --example list_users
+cargo run -p octelium --example users -- --help
+cargo run -p octelium --example services -- --help
+cargo run -p octelium --example policies -- --help
+cargo run -p octelium --example credentials -- --help
+cargo run -p octelium --example cluster_config -- --help
 cargo run --example http_service -- https://my-service.example.com/api
 ```
+
+See the [Core API examples](crates/octelium/examples/README.md) for practical
+resource workflows, pagination, credential rotation and ClusterConfig updates.
 
 ## Supported Rust version
 

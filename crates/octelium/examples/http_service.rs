@@ -10,18 +10,23 @@ use octelium::Client;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().any(|arg| arg == "--help") {
+        println!("http_service <HTTPS URL within the Cluster domain>");
+        return Ok(());
+    }
     let url = std::env::args()
         .nth(1)
         .ok_or("usage: http_service <url within the Cluster domain>")?;
 
     let client = Client::from_env().await?;
 
-    // The access token is attached only to the Cluster domain and its
-    // subdomains, so an unrelated URL is rejected before the request is sent.
-    let resp = client.http().get(&url).send().await?;
-
-    println!("{} {}", resp.status().as_u16(), url);
-    println!("{}", resp.text().await?);
-
-    Ok(())
+    let result = async {
+        let resp = client.http().get(&url).send().await?;
+        println!("{}", resp.status().as_u16());
+        println!("{}", resp.error_for_status()?.text().await?);
+        Ok(())
+    }
+    .await;
+    client.shutdown().await;
+    result
 }

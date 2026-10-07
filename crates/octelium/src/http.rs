@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ::http::header::{HeaderName, HeaderValue, AUTHORIZATION};
+use ::http::header::{HeaderName, HeaderValue, COOKIE, HOST};
 use reqwest::{Method, Request, Response};
 use url::Url;
 
@@ -49,6 +49,7 @@ where
 #[derive(Default)]
 pub(crate) struct HttpConfig {
     pub(crate) authorized_hosts: Vec<String>,
+    pub(crate) authorized_origins: Vec<String>,
     pub(crate) policy: Option<Arc<dyn HttpAuthorizationPolicy>>,
     pub(crate) allow_insecure: bool,
 }
@@ -61,25 +62,41 @@ pub(crate) fn build_client(
     root_ca_pems: &[Vec<u8>],
     accept_invalid_certs: bool,
 ) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
+    let mut roots = rustls::RootCertStore::empty();
+    #[cfg(feature = "tls-native-roots")]
+    roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    #[cfg(feature = "tls-webpki-roots")]
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for pem in root_ca_pems {
+        let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(pem))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::config("invalid root CA certificate"))?;
+        if certs.is_empty() {
+            return Err(Error::config("root CA PEM contains no certificates"));
+        }
+        for cert in certs {
+            roots
+                .add(cert)
+                .map_err(|_| Error::config("invalid root CA certificate"))?;
+        }
+    }
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    if accept_invalid_certs {
+        tls.dangerous()
+            .set_certificate_verifier(crate::tls::no_verification());
+    }
+    reqwest::Client::builder()
         .user_agent(user_agent)
         .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-        .pool_idle_timeout(DEFAULT_POOL_IDLE_TIMEOUT);
-
-    for pem in root_ca_pems {
-        builder = builder.add_root_certificate(
-            reqwest::Certificate::from_pem(pem)
-                .map_err(|err| Error::config(format!("invalid root CA certificate: {err}")))?,
-        );
-    }
-
-    if accept_invalid_certs {
-        builder = builder.danger_accept_invalid_certs(true);
-    }
-
-    builder
+        .pool_idle_timeout(DEFAULT_POOL_IDLE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .tls_backend_preconfigured(tls)
         .build()
-        .map_err(|err| Error::config(format!("could not build the HTTP client: {err}")))
+        .map_err(|_| Error::config("could not build the HTTP client"))
 }
 
 /// An HTTP client that attaches the Octelium access token to authorized
@@ -87,7 +104,7 @@ pub(crate) fn build_client(
 ///
 /// By default only the Cluster domain and its subdomains, over HTTPS, receive
 /// the token. Everything else is rejected before a connection is made, so a
-/// redirect or a misconfigured URL cannot leak the credential.
+/// redirects are returned to the caller without being followed.
 ///
 /// ```no_run
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -104,12 +121,11 @@ pub(crate) fn build_client(
 #[derive(Clone, Debug)]
 pub struct HttpClient {
     client: Client,
-    inner: reqwest::Client,
 }
 
 impl HttpClient {
-    pub(crate) fn new(client: Client, inner: reqwest::Client) -> Self {
-        Self { client, inner }
+    pub(crate) fn new(client: Client) -> Self {
+        Self { client }
     }
 
     /// Starts a `GET` request.
@@ -148,8 +164,12 @@ impl HttpClient {
             http: self.clone(),
             // Keep URL userinfo intact until destination authorization. The
             // normal reqwest constructor removes it and synthesizes Basic auth.
-            inner: url.into_url().map(|url| {
-                reqwest::RequestBuilder::from_parts(self.inner.clone(), Request::new(method, url))
+            inner: self.client.http_transport().and_then(|inner| {
+                let url = url.into_url()?;
+                Ok(reqwest::RequestBuilder::from_parts(
+                    inner,
+                    Request::new(method, url),
+                ))
             }),
         }
     }
@@ -158,40 +178,103 @@ impl HttpClient {
     pub async fn execute(&self, mut request: Request) -> Result<Response> {
         self.client.ensure_open()?;
         self.authorize(&request)?;
-
-        let token = self.client.token().await?;
-        let value = HeaderValue::from_str(&format!("Bearer {}", token.value)).map_err(|_| {
-            Error::authentication(message("the access token is not a valid header value"))
-        })?;
-
-        request.headers_mut().insert(AUTHORIZATION, value);
-
-        Ok(self.inner.execute(request).await?)
+        let timeout = request.timeout().copied().or(self.client.request_timeout());
+        let deadline = timeout
+            .map(|timeout| {
+                tokio::time::Instant::now()
+                    .checked_add(timeout)
+                    .ok_or_else(|| Error::config("request timeout is too large"))
+            })
+            .transpose()?;
+        let cancel = self.client.cancellation();
+        let operation = async {
+            let lease = self.client.token_lease().await?;
+            let mut value = HeaderValue::from_str(&lease.token.value)
+                .map_err(|_| Error::authentication(message("invalid access token")))?;
+            value.set_sensitive(true);
+            for name in [
+                "authorization",
+                "x-octelium-auth",
+                "x-octelium-refresh-token",
+            ] {
+                request.headers_mut().remove(name);
+            }
+            if let Some(cookie) = request.headers().get(COOKIE) {
+                let cookie = cookie
+                    .to_str()
+                    .map_err(|_| Error::config("invalid Cookie header"))?;
+                let filtered = cookie
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|cookie| {
+                        !matches!(
+                            cookie.split_once('=').map(|pair| pair.0.trim()),
+                            Some("octelium_auth" | "octelium_rt")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                request.headers_mut().remove(COOKIE);
+                if !filtered.is_empty() {
+                    request.headers_mut().insert(
+                        COOKIE,
+                        HeaderValue::from_str(&filtered)
+                            .map_err(|_| Error::config("invalid Cookie header"))?,
+                    );
+                }
+            }
+            request.headers_mut().insert("x-octelium-auth", value);
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(Error::DeadlineExceeded);
+                }
+                *request.timeout_mut() = Some(remaining);
+            }
+            let response = self.client.http_transport()?.execute(request).await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                self.client.invalidate_generation(lease.generation);
+            }
+            Ok(response)
+        };
+        let expired = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::Closed),
+            _ = expired => Err(Error::DeadlineExceeded),
+            result = operation => result,
+        }
     }
 
     /// Sends a request without attaching the access token.
     ///
-    /// The destination policy does not apply, because no credential leaves the
-    /// process.
-    pub async fn execute_unauthenticated(&self, request: Request) -> Result<Response> {
+    /// The destination policy does not apply. Redirects remain disabled.
+    pub async fn execute_unauthenticated(&self, mut request: Request) -> Result<Response> {
         self.client.ensure_open()?;
-        Ok(self.inner.execute(request).await?)
+        if request.timeout().is_none() {
+            *request.timeout_mut() = self.client.request_timeout();
+        }
+        let cancel = self.client.cancellation();
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::Closed),
+            result = self.client.http_transport()?.execute(request) => Ok(result?),
+        }
     }
 
-    /// Returns the underlying [`reqwest::Client`], which shares this client's
-    /// connection pool and TLS settings but attaches no access token.
-    pub fn inner(&self) -> &reqwest::Client {
-        &self.inner
+    /// Returns a clone of the underlying [`reqwest::Client`], without authentication.
+    /// The caller owns this clone independently of SDK shutdown.
+    pub fn inner(&self) -> Result<reqwest::Client> {
+        self.client.http_transport()
     }
 
     fn authorize(&self, request: &Request) -> Result<()> {
         let cfg = self.client.http_config();
-
-        if let Some(policy) = &cfg.policy {
-            return policy
-                .authorize(request)
-                .map_err(|source| self.rejected(request.url(), source));
-        }
 
         let url = request.url();
 
@@ -216,6 +299,43 @@ impl HttpClient {
             None => return Err(self.rejected(url, message("the URL has no host"))),
         };
 
+        if request.headers().get_all(HOST).iter().nth(1).is_some() {
+            return Err(self.rejected(url, message("multiple Host headers are not allowed")));
+        }
+        if let Some(authority) = request.headers().get(HOST) {
+            let authority = authority
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<::http::uri::Authority>().ok())
+                .ok_or_else(|| self.rejected(url, message("invalid Host header")))?;
+            let routed = domain::normalize_host(authority.host())
+                .map_err(|_| self.rejected(url, message("invalid Host header")))?;
+            if routed != host
+                || authority
+                    .port_u16()
+                    .unwrap_or(if url.scheme() == "https" { 443 } else { 80 })
+                    != url.port_or_known_default().unwrap_or(0)
+            {
+                return Err(self.rejected(url, message("Host header must match the URL authority")));
+            }
+        }
+        if let Some(policy) = &cfg.policy {
+            return policy
+                .authorize(request)
+                .map_err(|source| self.rejected(url, source));
+        }
+        if cfg
+            .authorized_origins
+            .contains(&url.origin().ascii_serialization())
+        {
+            return Ok(());
+        }
+        if url.port_or_known_default() != Some(if url.scheme() == "https" { 443 } else { 80 }) {
+            return Err(self.rejected(
+                url,
+                message("nondefault ports require an explicitly authorized origin"),
+            ));
+        }
         if domain::is_within(&host, self.client.domain()) {
             return Ok(());
         }
@@ -235,7 +355,7 @@ impl HttpClient {
     fn rejected(&self, url: &Url, source: BoxError) -> Error {
         Error::HttpAuthorization {
             url: redact(url),
-            source,
+            source: Arc::from(source),
         }
     }
 }
@@ -245,9 +365,10 @@ impl HttpClient {
 /// It mirrors [`reqwest::RequestBuilder`], and
 /// [`with`](RequestBuilder::with) hands the inner builder over for anything
 /// not covered here.
+#[must_use]
 pub struct RequestBuilder {
     http: HttpClient,
-    inner: std::result::Result<reqwest::RequestBuilder, reqwest::Error>,
+    inner: Result<reqwest::RequestBuilder>,
 }
 impl std::fmt::Debug for RequestBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -339,10 +460,7 @@ impl RequestBuilder {
 /// Returns the URL with any userinfo removed, so a credential embedded in it
 /// never reaches an error message or a log.
 fn redact(url: &Url) -> String {
-    let mut url = url.clone();
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.to_string()
+    url.origin().ascii_serialization()
 }
 
 #[cfg(test)]

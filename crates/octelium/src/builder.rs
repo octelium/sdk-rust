@@ -40,6 +40,7 @@ use crate::{domain, tls, Client};
 /// # Ok(())
 /// # }
 /// ```
+#[must_use]
 pub struct ClientBuilder {
     domain: Option<String>,
     api_endpoint: Option<String>,
@@ -51,15 +52,15 @@ pub struct ClientBuilder {
     user_agent: String,
     root_ca_pems: Vec<Vec<u8>>,
     accept_invalid_certs: bool,
-    authentication_timeout: Option<Duration>,
+    authentication_timeout: Duration,
+    request_timeout: Option<Duration>,
+    allow_insecure_api: bool,
     authenticate_on_build: bool,
     #[allow(clippy::type_complexity)]
     configure_endpoint: Option<Arc<dyn Fn(Endpoint) -> Endpoint + Send + Sync>>,
 
     #[cfg(feature = "http")]
     http: crate::http::HttpConfig,
-    #[cfg(feature = "http")]
-    http_client: Option<reqwest::Client>,
 }
 
 impl Default for ClientBuilder {
@@ -92,14 +93,14 @@ impl ClientBuilder {
             user_agent: DEFAULT_USER_AGENT.to_string(),
             root_ca_pems: Vec::new(),
             accept_invalid_certs: false,
-            authentication_timeout: Some(DEFAULT_AUTHENTICATION_TIMEOUT),
+            authentication_timeout: DEFAULT_AUTHENTICATION_TIMEOUT,
+            request_timeout: None,
+            allow_insecure_api: false,
             authenticate_on_build: false,
             configure_endpoint: None,
 
             #[cfg(feature = "http")]
             http: crate::http::HttpConfig::default(),
-            #[cfg(feature = "http")]
-            http_client: None,
         }
     }
 
@@ -181,7 +182,7 @@ impl ClientBuilder {
     /// Trusts an additional CA certificate, in PEM form, when verifying the
     /// Cluster.
     ///
-    /// The host's certificate store remains trusted as well.
+    /// The root stores selected by the TLS features remain trusted as well.
     pub fn add_root_ca_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
         self.root_ca_pems.push(pem.into());
         self
@@ -197,10 +198,22 @@ impl ClientBuilder {
         self
     }
 
-    /// Bounds authentication and refresh calls. `None` disables the SDK
-    /// timeout, leaving the caller in charge.
-    pub fn authentication_timeout(mut self, timeout: Option<Duration>) -> Self {
+    /// Bounds client-owned authentication and refresh calls. The timeout must
+    /// be positive and remains independent of each caller's deadline.
+    pub fn authentication_timeout(mut self, timeout: Duration) -> Self {
         self.authentication_timeout = timeout;
+        self
+    }
+
+    #[doc = "Sets a default request deadline, including token acquisition. Defaults to None so callers can control long-lived streams. Authentication remains bounded."]
+    pub fn request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    #[doc = "Allows credentials over a plaintext API endpoint. Use only for local development."]
+    pub fn allow_insecure_api(mut self, allow: bool) -> Self {
+        self.allow_insecure_api = allow;
         self
     }
 
@@ -254,7 +267,21 @@ impl ClientBuilder {
         self
     }
 
-    /// Replaces the default HTTP destination policy.
+    #[cfg(feature = "http")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
+    #[doc = "Authorizes exact HTTP origins, including scheme and port, in addition to the default Cluster hosts."]
+    pub fn authorized_http_origins<I, S>(mut self, origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.http
+            .authorized_origins
+            .extend(origins.into_iter().map(Into::into));
+        self
+    }
+
+    /// Replaces the default HTTP host policy. HTTPS and userinfo guards still apply.
     #[cfg(feature = "http")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
     pub fn http_authorization_policy(
@@ -275,20 +302,41 @@ impl ClientBuilder {
         self
     }
 
-    /// Installs a caller-owned [`reqwest::Client`] as the HTTP transport.
-    ///
-    /// The supplied client is used as-is, so it also has to carry any TLS
-    /// settings configured on this builder.
-    #[cfg(feature = "http")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
-    pub fn http_client(mut self, client: reqwest::Client) -> Self {
-        self.http_client = Some(client);
-        self
-    }
-
     /// Builds the Client.
     pub async fn build(self) -> Result<Client> {
+        if self.authentication_timeout.is_zero()
+            || self.authentication_timeout.as_nanos() > u64::MAX as u128
+            || self
+                .request_timeout
+                .is_some_and(|timeout| timeout.is_zero() || timeout.as_nanos() > u64::MAX as u128)
+        {
+            return Err(Error::config("timeouts must be positive and representable"));
+        }
+        if self
+            .scopes
+            .iter()
+            .any(|scope| scope.is_empty() || scope.bytes().any(|byte| byte.is_ascii_whitespace()))
+        {
+            return Err(Error::config(
+                "scopes must be nonempty and contain no whitespace",
+            ));
+        }
         install_crypto_provider();
+
+        for pem in &self.root_ca_pems {
+            let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(pem))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| Error::config("invalid root CA certificate"))?;
+            if certs.is_empty() {
+                return Err(Error::config("root CA PEM contains no certificates"));
+            }
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in certs {
+                roots
+                    .add(cert)
+                    .map_err(|_| Error::config("invalid root CA certificate"))?;
+            }
+        }
 
         let domain = domain::normalize(
             self.domain
@@ -326,6 +374,12 @@ impl ClientBuilder {
             .unwrap_or_else(|| format!("{default_server_name}:443"));
         let api_endpoint = domain::normalize_endpoint(&api_endpoint)?;
 
+        if api_endpoint.starts_with("http://") && !self.allow_insecure_api {
+            return Err(Error::config(
+                "plain HTTP API endpoints require allow_insecure_api(true)",
+            ));
+        }
+
         let mut endpoint = Endpoint::from_shared(api_endpoint.clone())
             .map_err(|err| Error::config(format!("invalid API endpoint: {err}")))?
             .user_agent(self.user_agent.clone())
@@ -354,14 +408,11 @@ impl ClientBuilder {
         }
 
         #[cfg(feature = "http")]
-        let http_client = match self.http_client {
-            Some(client) => client,
-            None => crate::http::build_client(
-                &self.user_agent,
-                &self.root_ca_pems,
-                self.accept_invalid_certs,
-            )?,
-        };
+        let http_client = crate::http::build_client(
+            &self.user_agent,
+            &self.root_ca_pems,
+            self.accept_invalid_certs,
+        )?;
 
         #[cfg(feature = "http")]
         let http = {
@@ -371,6 +422,15 @@ impl ClientBuilder {
                 .iter()
                 .map(domain::normalize_host)
                 .collect::<Result<Vec<_>>>()?;
+            http.authorized_origins = http.authorized_origins.iter().map(|origin| {
+                let url = reqwest::Url::parse(origin).map_err(|_| Error::config("invalid HTTP origin"))?;
+                if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none()
+                    || !url.username().is_empty() || url.password().is_some()
+                    || url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+                    return Err(Error::config("authorized HTTP origins must have no userinfo, paths, queries or fragments"));
+                }
+                Ok(url.origin().ascii_serialization())
+            }).collect::<Result<Vec<_>>>()?;
             http
         };
 
@@ -382,21 +442,30 @@ impl ClientBuilder {
             authenticator,
             token_provider,
             authentication_timeout: self.authentication_timeout,
+            request_timeout: self.request_timeout,
 
             #[cfg(feature = "http")]
             http,
         };
 
+        let channel = endpoint.connect_lazy();
+        let auth_channel = config
+            .authenticator
+            .as_ref()
+            .map(|_| endpoint.connect_lazy());
         let client = Client::from_parts(
             config,
-            endpoint.connect_lazy(),
-            endpoint.connect_lazy(),
+            channel,
+            auth_channel,
             #[cfg(feature = "http")]
             http_client,
         );
 
         if self.authenticate_on_build {
-            client.token().await?;
+            if let Err(err) = client.token().await {
+                client.shutdown().await;
+                return Err(err);
+            }
         }
 
         Ok(client)

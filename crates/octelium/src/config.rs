@@ -31,7 +31,8 @@ pub(crate) struct Config {
     pub(crate) scopes: Vec<String>,
     pub(crate) authenticator: Option<Arc<dyn Authenticator>>,
     pub(crate) token_provider: Option<Arc<dyn AccessTokenProvider>>,
-    pub(crate) authentication_timeout: Option<Duration>,
+    pub(crate) authentication_timeout: Duration,
+    pub(crate) request_timeout: Option<Duration>,
 
     #[cfg(feature = "http")]
     pub(crate) http: crate::http::HttpConfig,
@@ -44,9 +45,8 @@ impl std::fmt::Debug for Config {
             .field("api_endpoint", &self.api_endpoint)
             .field("tls_server_name", &self.tls_server_name)
             .field("scopes", &self.scopes)
-            .field("authenticator", &self.authenticator.is_some())
-            .field("token_provider", &self.token_provider.is_some())
             .field("authentication_timeout", &self.authentication_timeout)
+            .field("request_timeout", &self.request_timeout)
             .finish_non_exhaustive()
     }
 }

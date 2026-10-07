@@ -13,16 +13,13 @@
 // limitations under the License.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use octelium_apis::authv1;
 
-/// How long before expiration a token is proactively replaced.
-///
-/// [`Snapshot::new`] caps it at 20% of a short token's lifetime, so the
-/// effective leeway is always the smaller of the two.
+use crate::error::{Error, Result};
+
 pub(crate) const DEFAULT_REFRESH_BEFORE: Duration = Duration::from_secs(30);
 
 /// A bearer token for the Octelium Cluster and its known expiration time.
@@ -46,13 +43,13 @@ impl AccessToken {
     }
 
     /// Sets the expiration time.
+    #[must_use]
     pub fn with_expiry(mut self, expires_at: SystemTime) -> Self {
         self.expires_at = Some(expires_at);
         self
     }
 }
 
-// The token is a credential, so it never reaches logs through `Debug`.
 impl fmt::Debug for AccessToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AccessToken")
@@ -62,77 +59,64 @@ impl fmt::Debug for AccessToken {
     }
 }
 
-/// The token state at a point in time.
+#[derive(Clone, Debug)]
+pub(crate) struct TokenLease {
+    pub(crate) token: Arc<AccessToken>,
+    pub(crate) generation: u64,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct Snapshot {
-    pub(crate) access_token: String,
+    pub(crate) epoch: u64,
+    pub(crate) generation: u64,
+    access_token: Option<Arc<AccessToken>>,
     pub(crate) refresh_token: String,
-    /// The monotonic expiration deadline, immune to wall clock adjustments.
+    pub(crate) refresh_expires_at: Option<Instant>,
     expires_at: Option<Instant>,
-    /// The wall clock expiration time, reported to the application.
-    expires_at_wall: Option<SystemTime>,
-    /// When the token should be replaced, always at or before `expires_at`.
     refresh_at: Option<Instant>,
+    retry_at: Option<Instant>,
     invalidated: bool,
+    attempted: bool,
+    exchange_started: Option<Instant>,
+    closed: bool,
 }
 
 impl Snapshot {
-    fn new(
-        access_token: String,
-        refresh_token: String,
-        now: Instant,
-        lifetime: Option<Duration>,
-        refresh_before: Duration,
-    ) -> Self {
-        let mut ret = Self {
-            access_token,
-            refresh_token,
-            ..Default::default()
-        };
-
-        let Some(lifetime) = lifetime.filter(|lifetime| !lifetime.is_zero()) else {
-            return ret;
-        };
-
-        ret.expires_at = Some(now + lifetime);
-        ret.expires_at_wall = Some(SystemTime::now() + lifetime);
-
-        // Never consume more than 20% of a short token's lifetime as refresh
-        // leeway. This keeps the default useful for both minute-long and
-        // hour-long tokens without refreshing the latter excessively early.
-        let early = refresh_before.min(lifetime / 5);
-        ret.refresh_at = Some(now + lifetime - early);
-
-        ret
+    fn lease(&self) -> TokenLease {
+        TokenLease {
+            token: self.access_token.as_ref().unwrap().clone(),
+            generation: self.generation,
+        }
     }
 
-    fn token(&self) -> AccessToken {
-        AccessToken {
-            value: self.access_token.clone(),
-            expires_at: self.expires_at_wall,
-        }
+    fn usable(&self, now: Instant) -> bool {
+        !self.closed
+            && !self.invalidated
+            && self.access_token.is_some()
+            && self.expires_at.is_none_or(|expires_at| now < expires_at)
     }
 }
 
-/// The Client's token cache.
-///
-/// Reads take a shared lock, while [`TokenManager::refresh_lock`] serializes
-/// the authentication and refresh calls so concurrent callers share one
-/// in-flight token operation.
 pub(crate) struct TokenManager {
     state: RwLock<Snapshot>,
-    ever_authenticated: AtomicBool,
     pub(crate) refresh_lock: tokio::sync::Mutex<()>,
 }
 
-impl std::fmt::Debug for TokenManager {
+impl fmt::Debug for TokenManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.read();
         f.debug_struct("TokenManager")
-            .field("has_access_token", &!state.access_token.is_empty())
+            .field("has_access_token", &state.access_token.is_some())
             .field("has_refresh_token", &!state.refresh_token.is_empty())
-            .field("expires_at", &state.expires_at_wall)
+            .field(
+                "expires_at",
+                &state
+                    .access_token
+                    .as_ref()
+                    .and_then(|token| token.expires_at),
+            )
             .field("invalidated", &state.invalidated)
+            .field("closed", &state.closed)
             .finish()
     }
 }
@@ -141,7 +125,6 @@ impl TokenManager {
     pub(crate) fn new() -> Self {
         Self {
             state: RwLock::new(Snapshot::default()),
-            ever_authenticated: AtomicBool::new(false),
             refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -154,34 +137,23 @@ impl TokenManager {
         self.state.write().unwrap_or_else(|err| err.into_inner())
     }
 
-    /// Returns the token if it is valid and not yet due for replacement.
-    pub(crate) fn current(&self, now: Instant) -> Option<AccessToken> {
+    pub(crate) fn current(&self, now: Instant) -> Option<TokenLease> {
         let state = self.read();
-
-        if state.access_token.is_empty() || state.invalidated {
+        if !state.usable(now) {
             return None;
         }
-        if state.refresh_at.is_some_and(|refresh_at| now >= refresh_at) {
+        if state.refresh_at.is_some_and(|refresh_at| now >= refresh_at)
+            && state.retry_at.is_none_or(|retry_at| now >= retry_at)
+        {
             return None;
         }
-
-        Some(state.token())
+        Some(state.lease())
     }
 
-    /// Returns the token if it has not expired yet, even when it is already
-    /// due for replacement. This keeps a Cluster that is briefly unreachable
-    /// from breaking calls that would still succeed.
-    pub(crate) fn usable(&self, now: Instant) -> Option<AccessToken> {
+    #[cfg(test)]
+    pub(crate) fn usable(&self, now: Instant) -> Option<TokenLease> {
         let state = self.read();
-
-        if state.access_token.is_empty() || state.invalidated {
-            return None;
-        }
-        if state.expires_at.is_some_and(|expires_at| now >= expires_at) {
-            return None;
-        }
-
-        Some(state.token())
+        state.usable(now).then(|| state.lease())
     }
 
     pub(crate) fn snapshot(&self) -> Snapshot {
@@ -190,208 +162,348 @@ impl TokenManager {
 
     pub(crate) fn refresh_token(&self) -> Option<String> {
         let state = self.read();
-        if state.refresh_token.is_empty() {
-            return None;
-        }
-        Some(state.refresh_token.clone())
+        (!state.closed
+            && !state.refresh_token.is_empty()
+            && state
+                .refresh_expires_at
+                .is_some_and(|expiry| Instant::now() < expiry))
+        .then(|| state.refresh_token.clone())
     }
 
     pub(crate) fn has_ever_authenticated(&self) -> bool {
-        self.ever_authenticated.load(Ordering::Relaxed)
+        self.read().attempted
     }
 
-    /// Remembers an attempted exchange, including one that fails or is canceled.
-    pub(crate) fn mark_authentication_attempt(&self) {
-        self.ever_authenticated.store(true, Ordering::Relaxed);
+    pub(crate) fn has_rejected_access_token(&self) -> bool {
+        let state = self.read();
+        state.invalidated && state.access_token.is_some()
     }
 
-    /// Stores a Cluster Session. A Session token without a refresh token keeps
-    /// the previous one, which the Cluster omits when it is unchanged.
+    pub(crate) fn mark_exchange(&self, authentication: bool) {
+        let mut state = self.write();
+        state.exchange_started = Some(Instant::now());
+        state.attempted |= authentication;
+    }
+
+    pub(crate) fn exchange_started_since(&self, started: Instant) -> Instant {
+        self.read()
+            .exchange_started
+            .filter(|exchange| *exchange >= started)
+            .unwrap_or(started)
+    }
+
     pub(crate) fn set_session(
         &self,
         token: &authv1::SessionToken,
-        now: Instant,
-        refresh_before: Duration,
-        fallback_refresh_token: &str,
-    ) {
-        let refresh_token = match token.refresh_token.trim() {
-            "" => fallback_refresh_token,
-            value => value,
-        };
-
-        let lifetime = (token.expires_in > 0).then(|| Duration::from_secs(token.expires_in as u64));
-
-        *self.write() = Snapshot::new(
-            token.access_token.trim().to_string(),
-            refresh_token.to_string(),
-            now,
-            lifetime,
-            refresh_before,
-        );
-        self.ever_authenticated.store(true, Ordering::Relaxed);
-    }
-
-    /// Stores an externally managed access token.
-    pub(crate) fn set_external(&self, token: &AccessToken, now: Instant, refresh_before: Duration) {
-        let lifetime = token.expires_at.map(|expires_at| {
-            expires_at
-                .duration_since(SystemTime::now())
-                .unwrap_or_default()
-        });
-
-        *self.write() = Snapshot::new(
-            token.value.clone(),
-            String::new(),
-            now,
-            lifetime,
-            refresh_before,
-        );
-    }
-
-    /// Causes the next operation to obtain a new access token without
-    /// discarding a managed Session's refresh token.
-    pub(crate) fn invalidate_access_token(&self) {
-        let mut state = self.write();
-        if state.access_token.is_empty() {
-            return;
+        started: Instant,
+        epoch: u64,
+    ) -> Result<TokenLease> {
+        validate_value(&token.access_token)?;
+        let access_lifetime = lifetime(token.expires_in)?;
+        let expires_at = started
+            .checked_add(access_lifetime)
+            .ok_or_else(|| Error::Protocol("access token lifetime is too large".into()))?;
+        let now = Instant::now();
+        if expires_at <= now {
+            return Err(Error::Protocol(
+                "the access token expired during the exchange".into(),
+            ));
         }
-        state.invalidated = true;
+        let expires_at_wall = SystemTime::now()
+            .checked_add(expires_at.duration_since(now))
+            .ok_or_else(|| Error::Protocol("access token lifetime is too large".into()))?;
+        let replacement = if token.refresh_token.is_empty() {
+            None
+        } else {
+            validate_value(&token.refresh_token)?;
+            let expiry = started
+                .checked_add(lifetime(token.refresh_token_expires_in)?)
+                .ok_or_else(|| Error::Protocol("refresh token lifetime is too large".into()))?;
+            if expiry <= now {
+                return Err(Error::Protocol(
+                    "the refresh token expired during the exchange".into(),
+                ));
+            }
+            Some((token.refresh_token.clone(), expiry))
+        };
+        let mut state = self.write();
+        check_epoch(&state, epoch)?;
+        if let Some((value, expiry)) = replacement {
+            state.refresh_token = value;
+            state.refresh_expires_at = Some(expiry);
+        } else if state.refresh_token.is_empty()
+            || state.refresh_expires_at.is_none_or(|expiry| expiry <= now)
+        {
+            return Err(Error::Protocol(
+                "the Cluster returned no usable refresh token".into(),
+            ));
+        }
+        state.access_token = Some(Arc::new(AccessToken {
+            value: token.access_token.clone(),
+            expires_at: Some(expires_at_wall),
+        }));
+        state.expires_at = Some(expires_at);
+        state.refresh_at = Some(expires_at - DEFAULT_REFRESH_BEFORE.min(access_lifetime / 5));
+        state.retry_at = None;
+        state.invalidated = false;
+        state.attempted = true;
+        state.generation += 1;
+        Ok(state.lease())
+    }
+
+    pub(crate) fn set_external(&self, token: AccessToken, epoch: u64) -> Result<TokenLease> {
+        validate_value(&token.value)?;
+        let now = Instant::now();
+        let expiry = match token.expires_at {
+            Some(wall) => {
+                let remaining = wall.duration_since(SystemTime::now()).map_err(|_| {
+                    Error::Protocol("the provider returned an expired access token".into())
+                })?;
+                if remaining.is_zero() {
+                    return Err(Error::Protocol(
+                        "the provider returned an expired access token".into(),
+                    ));
+                }
+                let deadline = now
+                    .checked_add(remaining)
+                    .ok_or_else(|| Error::Protocol("access token lifetime is too large".into()))?;
+                Some((
+                    deadline,
+                    deadline - DEFAULT_REFRESH_BEFORE.min(remaining / 5),
+                ))
+            }
+            None => None,
+        };
+        let mut state = self.write();
+        check_epoch(&state, epoch)?;
+        state.access_token = Some(Arc::new(token));
+        state.expires_at = expiry.map(|value| value.0);
+        state.refresh_at = expiry.map(|value| value.1);
+        state.retry_at = None;
+        state.invalidated = false;
+        state.generation += 1;
+        Ok(state.lease())
+    }
+
+    pub(crate) fn discard_refresh(&self, epoch: u64) {
+        let mut state = self.write();
+        if state.epoch == epoch {
+            state.refresh_token.clear();
+            state.refresh_expires_at = None;
+        }
+    }
+
+    pub(crate) fn backoff(&self, epoch: u64) -> Option<TokenLease> {
+        let mut state = self.write();
+        let now = Instant::now();
+        if state.epoch != epoch || !state.usable(now) {
+            return None;
+        }
+        state.retry_at = now.checked_add(Duration::from_secs(1));
+        Some(state.lease())
+    }
+
+    pub(crate) fn invalidate_access_token(&self) {
+        self.write().invalidated = true;
+    }
+
+    pub(crate) fn invalidate_generation(&self, generation: u64) {
+        let mut state = self.write();
+        if state.generation == generation {
+            state.invalidated = true;
+            state.retry_at = None;
+        }
     }
 
     pub(crate) fn clear(&self) {
-        *self.write() = Snapshot::default();
+        let mut state = self.write();
+        *state = Snapshot {
+            epoch: state.epoch + 1,
+            generation: state.generation,
+            attempted: state.attempted,
+            closed: state.closed,
+            ..Default::default()
+        };
     }
+
+    pub(crate) fn close(&self) {
+        let mut state = self.write();
+        *state = Snapshot {
+            epoch: state.epoch + 1,
+            generation: state.generation,
+            attempted: state.attempted,
+            closed: true,
+            ..Default::default()
+        };
+    }
+}
+
+fn check_epoch(state: &Snapshot, epoch: u64) -> Result<()> {
+    if state.closed {
+        return Err(Error::Closed);
+    }
+    if state.epoch != epoch {
+        return Err(Error::SessionChanged);
+    }
+    Ok(())
+}
+
+fn lifetime(seconds: i64) -> Result<Duration> {
+    if seconds <= 0 {
+        return Err(Error::Protocol("token lifetimes must be positive".into()));
+    }
+    Ok(Duration::from_secs(seconds as u64))
+}
+
+pub(crate) fn validate_value(value: &str) -> Result<()> {
+    if value.is_empty() || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(Error::Protocol(
+            "token values must contain printable ASCII without whitespace".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn session(access_token: &str, expires_in: i64, refresh_token: &str) -> authv1::SessionToken {
+    fn session(expires_in: i64, refresh_token_expires_in: i64) -> authv1::SessionToken {
         authv1::SessionToken {
-            access_token: access_token.to_string(),
-            refresh_token: refresh_token.to_string(),
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
             expires_in,
-            refresh_token_expires_in: 0,
+            refresh_token_expires_in,
         }
     }
 
     #[test]
-    fn refresh_leeway_is_capped_at_a_fifth_of_the_lifetime() {
+    fn leeway_preserves_short_lived_tokens() {
         let manager = TokenManager::new();
-        let now = Instant::now();
-
-        // A 60 second token would otherwise be replaced after 30 seconds.
-        manager.set_session(
-            &session("tkn", 60, "refresh"),
-            now,
-            DEFAULT_REFRESH_BEFORE,
-            "",
-        );
-
-        assert!(manager.current(now + Duration::from_secs(47)).is_some());
-        assert!(manager.current(now + Duration::from_secs(49)).is_none());
-        assert!(manager.usable(now + Duration::from_secs(49)).is_some());
-        assert!(manager.usable(now + Duration::from_secs(61)).is_none());
+        let started = Instant::now();
+        manager.set_session(&session(10, 3600), started, 0).unwrap();
+        assert!(manager.current(started + Duration::from_secs(7)).is_some());
+        assert!(manager.current(started + Duration::from_secs(9)).is_none());
+        assert!(manager.usable(started + Duration::from_secs(9)).is_some());
+        assert!(manager.usable(started + Duration::from_secs(11)).is_none());
     }
 
     #[test]
-    fn long_lived_tokens_use_the_default_leeway() {
-        let manager = TokenManager::new();
-        let now = Instant::now();
-
-        manager.set_session(
-            &session("tkn", 3600, "refresh"),
-            now,
-            DEFAULT_REFRESH_BEFORE,
-            "",
-        );
-
-        assert!(manager.current(now + Duration::from_secs(3569)).is_some());
-        assert!(manager.current(now + Duration::from_secs(3571)).is_none());
+    fn invalid_lifetimes_are_rejected_without_publication() {
+        for token in [
+            session(0, 3600),
+            session(-1, 3600),
+            session(i64::MAX, 3600),
+            session(3600, 0),
+            session(3600, -1),
+            session(3600, i64::MAX),
+        ] {
+            let manager = TokenManager::new();
+            assert!(manager.set_session(&token, Instant::now(), 0).is_err());
+            assert!(manager.current(Instant::now()).is_none());
+            assert!(manager.refresh_token().is_none());
+        }
     }
 
     #[test]
-    fn a_token_without_an_expiry_never_goes_stale() {
+    fn exchange_latency_is_subtracted_from_the_token_lifetime() {
         let manager = TokenManager::new();
-        let now = Instant::now();
-
-        manager.set_session(
-            &session("tkn", 0, "refresh"),
-            now,
-            DEFAULT_REFRESH_BEFORE,
-            "",
-        );
-
-        let token = manager.current(now + Duration::from_secs(86_400)).unwrap();
-        assert_eq!(token.value, "tkn");
-        assert!(token.expires_at.is_none());
+        let started = Instant::now() - Duration::from_secs(4);
+        manager.set_session(&session(10, 3600), started, 0).unwrap();
+        assert!(manager.usable(started + Duration::from_secs(9)).is_some());
+        assert!(manager.usable(started + Duration::from_secs(11)).is_none());
+        assert!(manager.set_session(&session(1, 3600), started, 0).is_err());
     }
 
     #[test]
-    fn an_omitted_refresh_token_keeps_the_previous_one() {
+    fn omitted_refresh_tokens_keep_their_original_expiry() {
         let manager = TokenManager::new();
-        let now = Instant::now();
-
-        manager.set_session(
-            &session("first", 60, "refresh"),
-            now,
-            DEFAULT_REFRESH_BEFORE,
-            "",
-        );
-        manager.set_session(
-            &session("second", 60, ""),
-            now,
-            DEFAULT_REFRESH_BEFORE,
-            "refresh",
-        );
-
+        let started = Instant::now();
+        manager.set_session(&session(10, 60), started, 0).unwrap();
+        let expiry = manager.snapshot().refresh_expires_at;
+        let mut token = session(10, 3600);
+        token.refresh_token.clear();
+        manager.set_session(&token, started, 0).unwrap();
+        assert_eq!(manager.snapshot().refresh_expires_at, expiry);
         assert_eq!(manager.refresh_token().as_deref(), Some("refresh"));
-        assert_eq!(manager.current(now).unwrap().value, "second");
     }
 
     #[test]
-    fn invalidation_keeps_the_refresh_token() {
+    fn initial_sessions_require_a_refresh_token() {
         let manager = TokenManager::new();
-        let now = Instant::now();
+        let mut token = session(10, 3600);
+        token.refresh_token.clear();
+        assert!(manager.set_session(&token, Instant::now(), 0).is_err());
+    }
 
-        manager.set_session(
-            &session("tkn", 3600, "refresh"),
-            now,
-            DEFAULT_REFRESH_BEFORE,
-            "",
+    #[test]
+    fn older_rejections_do_not_invalidate_newer_tokens() {
+        let manager = TokenManager::new();
+        let started = Instant::now();
+        let first = manager.set_session(&session(10, 3600), started, 0).unwrap();
+        let second = manager.set_session(&session(10, 3600), started, 0).unwrap();
+        manager.invalidate_generation(first.generation);
+        assert_eq!(
+            manager.current(started).unwrap().generation,
+            second.generation
         );
-        manager.invalidate_access_token();
+        manager.invalidate_generation(second.generation);
+        assert!(manager.usable(started).is_none());
+    }
 
-        assert!(manager.current(now).is_none());
-        assert!(manager.usable(now).is_none());
-        assert_eq!(manager.refresh_token().as_deref(), Some("refresh"));
-        assert!(manager.has_ever_authenticated());
-
+    #[test]
+    fn clearing_and_closing_block_old_publications() {
+        let manager = TokenManager::new();
         manager.clear();
-        assert!(manager.refresh_token().is_none());
-        // Clearing the tokens does not un-authenticate the Client.
-        assert!(manager.has_ever_authenticated());
+        assert!(matches!(
+            manager.set_session(&session(10, 3600), Instant::now(), 0),
+            Err(Error::SessionChanged)
+        ));
+        manager.close();
+        assert!(matches!(
+            manager.set_session(&session(10, 3600), Instant::now(), 2),
+            Err(Error::Closed)
+        ));
+        assert!(matches!(
+            manager.set_external(AccessToken::new("access"), 2),
+            Err(Error::Closed)
+        ));
     }
 
     #[test]
-    fn external_tokens_expire_on_their_own_schedule() {
+    fn fallback_never_uses_rejected_or_expired_tokens() {
         let manager = TokenManager::new();
-        let now = Instant::now();
+        manager
+            .set_session(&session(10, 3600), Instant::now(), 0)
+            .unwrap();
+        assert!(manager.backoff(0).is_some());
+        manager.invalidate_access_token();
+        assert!(manager.backoff(0).is_none());
+    }
 
-        manager.set_external(
-            &AccessToken::new("tkn").with_expiry(SystemTime::now() + Duration::from_secs(600)),
-            now,
-            DEFAULT_REFRESH_BEFORE,
-        );
-
-        assert!(manager.current(now + Duration::from_secs(560)).is_some());
-        assert!(manager.current(now + Duration::from_secs(575)).is_none());
+    #[test]
+    fn external_tokens_with_unknown_expiry_remain_valid() {
+        let manager = TokenManager::new();
+        manager.set_external(AccessToken::new("access"), 0).unwrap();
+        assert!(manager
+            .current(Instant::now() + Duration::from_secs(86400))
+            .is_some());
         assert!(manager.refresh_token().is_none());
     }
 
     #[test]
-    fn the_token_value_is_redacted() {
+    fn expired_external_tokens_and_unsafe_token_values_are_rejected() {
+        let manager = TokenManager::new();
+        assert!(manager
+            .set_external(AccessToken::new("access").with_expiry(SystemTime::now()), 0)
+            .is_err());
+        for value in ["", "a b", "a\n", " a", "é", "a\t"] {
+            assert!(manager.set_external(AccessToken::new(value), 0).is_err());
+        }
+    }
+
+    #[test]
+    fn token_debug_is_redacted() {
         let token = AccessToken::new("super-secret");
         assert!(!format!("{token:?}").contains("super-secret"));
     }

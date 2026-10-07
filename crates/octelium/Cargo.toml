@@ -18,24 +18,26 @@ default = ["http", "tls-native-roots"]
 # An authenticated HTTP client for Octelium Services.
 http = ["dep:reqwest", "dep:url"]
 # Verify Cluster certificates against the host's certificate store.
-tls-native-roots = ["tonic/tls-native-roots"]
+tls-native-roots = ["tonic/tls-native-roots", "dep:rustls-native-certs"]
 # Verify Cluster certificates against the certificates compiled into webpki-roots.
-tls-webpki-roots = ["tonic/tls-webpki-roots"]
+tls-webpki-roots = ["tonic/tls-webpki-roots", "dep:webpki-roots"]
 
 [dependencies]
 octelium-apis = { workspace = true, features = ["client", "channel"] }
 
 async-trait = "0.1"
 http = "1"
+http-body = "1"
+rustls-pemfile = "2"
+rustls-native-certs = { version = "0.8", optional = true }
+webpki-roots = { version = "1", optional = true }
 idna = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = "1"
-thiserror = "2"
-tokio = { version = "1", features = ["fs", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "rt", "sync", "time"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "channel", "tls-ring"] }
 tower-service = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
-tracing = "0.1"
 
 reqwest = { version = "0.13", default-features = false, features = [
     "charset",
@@ -49,7 +51,7 @@ url = { version = "2", optional = true }
 
 [dev-dependencies]
 octelium-apis = { workspace = true, features = ["client", "channel", "server"] }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["router", "server"] }
 

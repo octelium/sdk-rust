@@ -14,8 +14,12 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
 use std::time::Instant;
+use tokio::sync::watch;
+use tokio_util::task::TaskTracker;
 
 use octelium_apis::{authv1, cordiumv1, corev1, userv1};
 use tonic::transport::Channel;
@@ -25,12 +29,12 @@ use crate::builder::ClientBuilder;
 use crate::config::Config;
 use crate::error::{message, Error, Result};
 use crate::grpc::{AuthServiceClient, AuthenticatedChannel, SessionChannel};
-use crate::token::{AccessToken, TokenManager, DEFAULT_REFRESH_BEFORE};
+use crate::token::{AccessToken, TokenLease, TokenManager};
 
 /// An authenticated Octelium Cluster client.
 ///
-/// A Client owns the Cluster Session, the access token and the shared HTTP/2
-/// connection. It is cheap to clone, and every clone shares that state, so an
+/// A Client owns the Cluster Session, the access token and separate shared API
+/// and authentication channels. It is cheap to clone, and every clone shares that state, so an
 /// application normally creates one Client per Cluster and shares it for the
 /// lifetime of the process.
 ///
@@ -61,19 +65,27 @@ struct Inner {
     closed: AtomicBool,
     close_cancel: tokio_util::sync::CancellationToken,
 
-    /// The shared connection to the Cluster API. tonic reconnects on its own,
-    /// so it is created lazily and never dialed here.
+    resources: RwLock<Option<Resources>>,
+    pending: Mutex<Option<watch::Receiver<Option<Result<TokenLease>>>>>,
+    tasks: TaskTracker,
+}
+
+struct Resources {
     channel: Channel,
-
-    /// The authentication client, which carries the Session's refresh token
-    /// rather than the access token.
-    ///
-    /// It has a connection of its own so that a token refresh cannot be
-    /// blocked by API calls that are themselves waiting for that token.
-    auth: AuthServiceClient,
-
+    auth_channel: Option<Channel>,
+    authenticator: Option<Arc<dyn crate::Authenticator>>,
+    token_provider: Option<Arc<dyn crate::AccessTokenProvider>>,
     #[cfg(feature = "http")]
     http: reqwest::Client,
+}
+
+impl std::fmt::Debug for Resources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resources")
+            .field("managed_session", &self.authenticator.is_some())
+            .field("external_tokens", &self.token_provider.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Client {
@@ -97,24 +109,29 @@ impl Client {
     }
 
     pub(crate) fn from_parts(
-        cfg: Config,
+        mut cfg: Config,
         channel: Channel,
-        auth_channel: Channel,
+        auth_channel: Option<Channel>,
         #[cfg(feature = "http")] http: reqwest::Client,
     ) -> Self {
         let tokens = Arc::new(TokenManager::new());
-        let auth = AuthServiceClient::new(SessionChannel::new(auth_channel, tokens.clone()));
-
+        let resources = Resources {
+            channel,
+            auth_channel,
+            authenticator: cfg.authenticator.take(),
+            token_provider: cfg.token_provider.take(),
+            #[cfg(feature = "http")]
+            http,
+        };
         Self {
             inner: Arc::new(Inner {
                 cfg,
                 tokens,
                 closed: AtomicBool::new(false),
                 close_cancel: tokio_util::sync::CancellationToken::new(),
-                channel,
-                auth,
-                #[cfg(feature = "http")]
-                http,
+                resources: RwLock::new(Some(resources)),
+                pending: Mutex::new(None),
+                tasks: TaskTracker::new(),
             }),
         }
     }
@@ -139,33 +156,72 @@ impl Client {
     ///
     /// Concurrent callers share one in-flight token operation.
     pub async fn token(&self) -> Result<AccessToken> {
-        self.ensure_open()?;
-
-        if let Some(token) = self.inner.tokens.current(Instant::now()) {
-            return Ok(token);
-        }
-
-        // The worker owns the exchange independently of callers. Dropping a
-        // caller must not lose a one-time credential or a rotated refresh token.
-        let client = self.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                _ = client.inner.close_cancel.cancelled() => Err(Error::Closed),
-                result = client.token_locked() => result,
-            }
-        })
-        .await
-        .map_err(|err| Error::authentication(message(format!("token task failed: {err}"))))?
+        Ok((*self.token_lease().await?.token).clone())
     }
 
-    async fn token_locked(&self) -> Result<AccessToken> {
+    pub(crate) async fn token_lease(&self) -> Result<TokenLease> {
+        self.ensure_open()?;
+        if let Some(token) = self.inner.tokens.current(Instant::now()) {
+            self.ensure_open()?;
+            return Ok(token);
+        }
+        let mut receiver = {
+            let mut pending = self
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            self.ensure_open()?;
+            if pending
+                .as_ref()
+                .is_some_and(|receiver| receiver.has_changed().is_err())
+            {
+                *pending = None;
+            }
+            if let Some(token) = self.inner.tokens.current(Instant::now()) {
+                return Ok(token);
+            }
+            if let Some(receiver) = &*pending {
+                receiver.clone()
+            } else {
+                let (sender, receiver) = watch::channel(None);
+                *pending = Some(receiver.clone());
+                let client = self.clone();
+                self.inner.tasks.spawn(async move {
+                    let result = tokio::select! {
+                        biased;
+                        _ = client.inner.close_cancel.cancelled() => Err(Error::Closed),
+                        result = client.token_locked() => result,
+                    };
+                    let mut pending = client
+                        .inner
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner());
+                    sender.send_replace(Some(result));
+                    *pending = None;
+                });
+                receiver
+            }
+        };
+        loop {
+            if let Some(result) = receiver.borrow_and_update().clone() {
+                self.ensure_open()?;
+                return result;
+            }
+            receiver.changed().await.map_err(|_| {
+                Error::authentication(message("the token worker stopped before completing"))
+            })?;
+        }
+    }
+
+    async fn token_locked(&self) -> Result<TokenLease> {
         let _guard = self.inner.tokens.refresh_lock.lock().await;
         self.ensure_open()?;
         if let Some(token) = self.inner.tokens.current(Instant::now()) {
             return Ok(token);
         }
-        if self.inner.cfg.token_provider.is_some() {
+        if self.external_provider()?.is_some() {
             return self.obtain_external_token().await;
         }
         self.obtain_managed_token().await
@@ -187,7 +243,7 @@ impl Client {
     /// It returns [`Error::NoManagedSession`] when the Client uses an
     /// externally managed access token.
     pub async fn logout(&self) -> Result<()> {
-        if self.inner.cfg.token_provider.is_some() {
+        if self.external_provider()?.is_some() {
             return Err(Error::NoManagedSession);
         }
         self.ensure_open()?;
@@ -200,7 +256,7 @@ impl Client {
             return Ok(());
         }
 
-        let mut auth = self.inner.auth.clone();
+        let mut auth = self.authentication_client(false)?;
         let result = self
             .with_timeout(async move { auth.logout(authv1::LogoutRequest {}).await })
             .await;
@@ -226,13 +282,30 @@ impl Client {
 
     /// Releases the Client.
     ///
-    /// Later operations return [`Error::Closed`], and the tokens are dropped.
-    /// The connection itself is closed once the last clone of this Client is
-    /// dropped. It does not log out.
+    /// Later operations return [`Error::Closed`]. Owned tokens, credentials and
+    /// transports are released. Use [`shutdown`](Self::shutdown) to wait for
+    /// authentication workers. It does not log out.
     pub fn close(&self) {
+        let _pending = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         self.inner.closed.store(true, Ordering::Release);
         self.inner.close_cancel.cancel();
-        self.inner.tokens.clear();
+        self.inner.tokens.close();
+        self.inner.tasks.close();
+        self.inner
+            .resources
+            .write()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+    }
+
+    #[doc = "Closes all clones, releases owned transports and credentials, and waits for authentication workers to stop. It does not log out."]
+    pub async fn shutdown(&self) {
+        self.close();
+        self.inner.tasks.wait().await;
     }
 
     /// Reports whether [`close`](Self::close) was called.
@@ -245,14 +318,14 @@ impl Client {
     /// Pass it to any generated `octelium-apis` client. The channel attaches a
     /// valid access token to every call.
     pub fn channel(&self) -> AuthenticatedChannel {
-        AuthenticatedChannel::new(self.inner.channel.clone(), self.clone())
+        AuthenticatedChannel::new(self.clone())
     }
 
     /// Returns the underlying tonic [`Channel`], without authentication.
     ///
     /// This is an escape hatch for calls that must not carry the access token.
-    pub fn raw_channel(&self) -> Channel {
-        self.inner.channel.clone()
+    pub fn raw_channel(&self) -> Result<Channel> {
+        self.api_channel()
     }
 
     /// Returns an authenticated `octelium.api.main.core.v1.MainService`
@@ -265,12 +338,6 @@ impl Client {
     /// client, the API available to every Cluster User.
     pub fn user_v1(&self) -> userv1::main_service_client::MainServiceClient<AuthenticatedChannel> {
         userv1::main_service_client::MainServiceClient::new(self.channel())
-    }
-
-    /// Returns an authenticated `octelium.api.main.auth.v1.MainService`
-    /// client, used to manage Authenticators and Devices.
-    pub fn auth_v1(&self) -> authv1::main_service_client::MainServiceClient<AuthenticatedChannel> {
-        authv1::main_service_client::MainServiceClient::new(self.channel())
     }
 
     /// Returns an authenticated `octelium.api.main.cordium.v1.MainService`
@@ -302,7 +369,7 @@ impl Client {
     #[cfg(feature = "http")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
     pub fn http(&self) -> crate::http::HttpClient {
-        crate::http::HttpClient::new(self.clone(), self.inner.http.clone())
+        crate::http::HttpClient::new(self.clone())
     }
 
     #[cfg(feature = "http")]
@@ -317,138 +384,187 @@ impl Client {
         Ok(())
     }
 
-    async fn obtain_external_token(&self) -> Result<AccessToken> {
-        let provider = self
-            .inner
-            .cfg
-            .token_provider
-            .clone()
-            .ok_or(Error::NoCredentials)?;
+    pub(crate) fn cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.inner.close_cancel.clone()
+    }
 
+    pub(crate) fn request_timeout(&self) -> Option<Duration> {
+        self.inner.cfg.request_timeout
+    }
+
+    pub(crate) fn invalidate_generation(&self, generation: u64) {
+        self.inner.tokens.invalidate_generation(generation);
+    }
+
+    pub(crate) fn api_channel(&self) -> Result<Channel> {
+        self.ensure_open()?;
+        self.inner
+            .resources
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .as_ref()
+            .map(|resources| resources.channel.clone())
+            .ok_or(Error::Closed)
+    }
+
+    fn authentication_client(&self, authentication: bool) -> Result<AuthServiceClient> {
+        let channel = self
+            .inner
+            .resources
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .as_ref()
+            .ok_or(Error::Closed)?
+            .auth_channel
+            .clone()
+            .ok_or(Error::NoManagedSession)?;
+        Ok(AuthServiceClient::new(SessionChannel::new(
+            channel,
+            self.inner.tokens.clone(),
+            self.cancellation(),
+            authentication,
+        )))
+    }
+
+    fn external_provider(&self) -> Result<Option<Arc<dyn crate::AccessTokenProvider>>> {
+        self.inner
+            .resources
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .as_ref()
+            .map(|resources| resources.token_provider.clone())
+            .ok_or(Error::Closed)
+    }
+
+    fn authenticator(&self) -> Result<Arc<dyn crate::Authenticator>> {
+        self.inner
+            .resources
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .as_ref()
+            .ok_or(Error::Closed)?
+            .authenticator
+            .clone()
+            .ok_or(Error::NoCredentials)
+    }
+
+    #[cfg(feature = "http")]
+    pub(crate) fn http_transport(&self) -> Result<reqwest::Client> {
+        self.inner
+            .resources
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .as_ref()
+            .map(|resources| resources.http.clone())
+            .ok_or(Error::Closed)
+    }
+
+    async fn obtain_external_token(&self) -> Result<TokenLease> {
+        let provider = self.external_provider()?.ok_or(Error::NoCredentials)?;
+        if self.inner.tokens.has_rejected_access_token() && !provider.can_replace_rejected_token() {
+            return Err(Error::AccessTokenRejected);
+        }
+        let epoch = self.inner.tokens.snapshot().epoch;
         let token = match self
             .with_timeout(async move { provider.token().await.map_err(Error::authentication) })
             .await
         {
             Ok(token) => token,
             Err(err) => {
-                // A provider that is briefly unavailable must not invalidate a
-                // token that is still good.
-                if let Some(current) = self.inner.tokens.usable(Instant::now()) {
-                    tracing::warn!(
-                        error = %err,
-                        "could not proactively replace the access token; using the still-valid token"
-                    );
-                    return Ok(current);
+                if matches!(
+                    crate::grpc::error_code(&err),
+                    None | Some(
+                        Code::Unavailable
+                            | Code::Internal
+                            | Code::Unknown
+                            | Code::DeadlineExceeded
+                            | Code::ResourceExhausted
+                    )
+                ) {
+                    if let Some(current) = self.inner.tokens.backoff(epoch) {
+                        return Ok(current);
+                    }
                 }
-                return Err(Error::authentication(err));
+                return Err(err);
             }
         };
-
-        let token = AccessToken {
-            value: token.value.trim().to_string(),
-            expires_at: token.expires_at,
-        };
-
-        if token.value.is_empty() {
-            return Err(Error::authentication(message(
-                "the access token provider returned an empty token",
-            )));
-        }
-        if token
-            .expires_at
-            .is_some_and(|expires_at| expires_at <= std::time::SystemTime::now())
-        {
-            return Err(Error::authentication(message(
-                "the access token provider returned an expired token",
-            )));
-        }
-
-        let now = Instant::now();
-        self.inner
-            .tokens
-            .set_external(&token, now, DEFAULT_REFRESH_BEFORE);
-        self.ensure_open()?;
-
-        self.inner.tokens.current(now).ok_or_else(|| {
-            Error::authentication(message("the access token became stale immediately"))
-        })
+        self.inner.tokens.set_external(token, epoch)
     }
 
-    async fn obtain_managed_token(&self) -> Result<AccessToken> {
+    async fn obtain_managed_token(&self) -> Result<TokenLease> {
         let snapshot = self.inner.tokens.snapshot();
-
-        if !snapshot.refresh_token.is_empty() {
-            match self.refresh_session(&snapshot.refresh_token).await {
+        if !snapshot.refresh_token.is_empty()
+            && snapshot
+                .refresh_expires_at
+                .is_some_and(|expiry| Instant::now() < expiry)
+        {
+            let started = Instant::now();
+            let mut auth = self.authentication_client(false)?;
+            let result = self
+                .with_timeout(async move {
+                    auth.authenticate_with_refresh_token(
+                        authv1::AuthenticateWithRefreshTokenRequest {},
+                    )
+                    .await
+                })
+                .await
+                .and_then(|response| {
+                    self.inner.tokens.set_session(
+                        &response.into_inner(),
+                        self.inner.tokens.exchange_started_since(started),
+                        snapshot.epoch,
+                    )
+                });
+            match result {
                 Ok(token) => return Ok(token),
                 Err(err) => {
-                    if !is_unauthenticated(&err) {
-                        if let Some(current) = self.inner.tokens.usable(Instant::now()) {
-                            tracing::warn!(
-                                error = %err,
-                                "could not proactively refresh the Session; using the still-valid access token"
-                            );
-                            return Ok(current);
-                        }
-                        return Err(Error::Refresh(Box::new(err)));
+                    let code = crate::grpc::error_code(&err);
+                    let safely_rejected = code == Some(Code::AlreadyExists);
+                    if !safely_rejected {
+                        self.inner.tokens.discard_refresh(snapshot.epoch);
                     }
-
-                    // The refresh token is gone, so only a full
-                    // reauthentication can recover the Session.
-                    self.inner.tokens.clear();
-                    if !self.can_reauthenticate() {
-                        return Err(Error::SessionExpired);
+                    if code == Some(Code::Unauthenticated) {
+                        self.inner.tokens.invalidate_access_token();
+                        if !self.can_reauthenticate() {
+                            return Err(Error::SessionExpired);
+                        }
+                    } else {
+                        if matches!(
+                            code,
+                            Some(
+                                Code::AlreadyExists
+                                    | Code::ResourceExhausted
+                                    | Code::Unavailable
+                                    | Code::Internal
+                                    | Code::Unknown
+                                    | Code::DeadlineExceeded
+                            )
+                        ) {
+                            if let Some(current) = self.inner.tokens.backoff(snapshot.epoch) {
+                                return Ok(current);
+                            }
+                        }
+                        return Err(Error::Refresh(Arc::new(err)));
                     }
                 }
             }
+        } else {
+            self.inner.tokens.discard_refresh(snapshot.epoch);
         }
-
         if self.inner.tokens.has_ever_authenticated() && !self.can_reauthenticate() {
+            if let Some(current) = self.inner.tokens.backoff(snapshot.epoch) {
+                return Ok(current);
+            }
             return Err(Error::SessionExpired);
         }
-
-        self.authenticate().await
+        self.authenticate(snapshot.epoch).await
     }
 
-    async fn refresh_session(&self, previous_refresh_token: &str) -> Result<AccessToken> {
-        let mut auth = self.inner.auth.clone();
-
-        let token = self
-            .with_timeout(async move {
-                auth.authenticate_with_refresh_token(authv1::AuthenticateWithRefreshTokenRequest {})
-                    .await
-            })
-            .await?
-            .into_inner();
-
-        validate_session_token(&token)?;
-
-        let now = Instant::now();
-        self.inner
-            .tokens
-            .set_session(&token, now, DEFAULT_REFRESH_BEFORE, previous_refresh_token);
-        self.ensure_open()?;
-
-        self.inner.tokens.current(now).ok_or_else(|| {
-            Error::Refresh(message(
-                "the refreshed access token became stale immediately",
-            ))
-        })
-    }
-
-    async fn authenticate(&self) -> Result<AccessToken> {
-        let authenticator = self
-            .inner
-            .cfg
-            .authenticator
-            .clone()
-            .ok_or(Error::NoCredentials)?;
-
-        let auth = self.inner.auth.clone();
+    async fn authenticate(&self, epoch: u64) -> Result<TokenLease> {
+        let authenticator = self.authenticator()?;
+        let auth = self.authentication_client(true)?;
         let scopes = self.inner.cfg.scopes.clone();
-
-        // An attempted one-time exchange may have reached the server even
-        // when it times out or its response is lost. Never replay it.
-        self.inner.tokens.mark_authentication_attempt();
+        let started = Instant::now();
         let token = self
             .with_timeout(async move {
                 authenticator
@@ -457,61 +573,60 @@ impl Client {
                     .map_err(Error::authentication)
             })
             .await?;
-
-        validate_session_token(&token)?;
-
-        let now = Instant::now();
-        self.inner
-            .tokens
-            .set_session(&token, now, DEFAULT_REFRESH_BEFORE, "");
-        self.ensure_open()?;
-
-        self.inner.tokens.current(now).ok_or_else(|| {
-            Error::authentication(message("the access token became stale immediately"))
-        })
+        self.inner.tokens.set_session(
+            &token,
+            self.inner.tokens.exchange_started_since(started),
+            epoch,
+        )
     }
 
     fn can_reauthenticate(&self) -> bool {
-        self.inner
-            .cfg
-            .authenticator
-            .as_ref()
-            .is_some_and(|authenticator| authenticator.can_reauthenticate())
+        self.authenticator()
+            .is_ok_and(|authenticator| authenticator.can_reauthenticate())
     }
 
-    /// Bounds an authentication or refresh call by the configured timeout.
     async fn with_timeout<F, T, E>(&self, future: F) -> Result<T>
     where
         F: Future<Output = std::result::Result<T, E>>,
         E: Into<Error>,
     {
-        let Some(timeout) = self.inner.cfg.authentication_timeout else {
-            return future.await.map_err(Into::into);
-        };
-
-        match tokio::time::timeout(timeout, future).await {
-            Ok(result) => result.map_err(Into::into),
-            Err(_) => Err(Error::authentication(message(format!(
-                "the operation did not complete within {timeout:?}"
-            )))),
+        tokio::select! {
+            biased;
+            _ = self.inner.close_cancel.cancelled() => Err(Error::Closed),
+            result = tokio::time::timeout(self.inner.cfg.authentication_timeout, future) => {
+                result.map_err(|_| Error::DeadlineExceeded)?.map_err(Into::into)
+            }
         }
     }
 }
 
-fn validate_session_token(token: &authv1::SessionToken) -> Result<()> {
-    if token.access_token.trim().is_empty() {
-        return Err(Error::authentication(message(
-            "the Cluster returned an empty access token",
-        )));
-    }
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Reports whether the Cluster rejected the credential itself, rather than
-/// failing for a transient reason.
-fn is_unauthenticated(err: &Error) -> bool {
-    match err {
-        Error::Status(status) => status.code() == Code::Unauthenticated,
-        _ => false,
+    #[tokio::test]
+    async fn losing_refresh_credentials_preserves_an_unexpired_access_token() {
+        let client = Client::builder()
+            .domain("example.com")
+            .authenticator(crate::AuthenticationToken::new("one-time"))
+            .build()
+            .await
+            .unwrap();
+        let token = authv1::SessionToken {
+            access_token: "still-valid".into(),
+            refresh_token: "refresh".into(),
+            expires_in: 10,
+            refresh_token_expires_in: 3600,
+        };
+        client
+            .inner
+            .tokens
+            .set_session(&token, Instant::now() - Duration::from_secs(9), 0)
+            .unwrap();
+        client.inner.tokens.discard_refresh(0);
+        assert_eq!(client.access_token().await.unwrap(), "still-valid");
+        client.invalidate_access_token();
+        assert!(matches!(client.token().await, Err(Error::SessionExpired)));
+        client.shutdown().await;
     }
 }

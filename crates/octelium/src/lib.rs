@@ -61,7 +61,7 @@
 //! # Sessions
 //!
 //! The Client obtains an access token on the first call that needs one, and
-//! replaces it shortly before it expires. Concurrent callers share one
+//! replaces it on demand shortly before it expires. Concurrent callers share one
 //! in-flight authentication. A Session created from a reusable credential,
 //! such as an assertion, is re-created after it expires; one created from a
 //! one-time authentication token is not, and the Client then returns
@@ -70,10 +70,12 @@
 //! # Cloning and shutdown
 //!
 //! [`Client`] is cheap to clone and safe to share across tasks: every clone
-//! shares one Session, one token cache and one HTTP/2 connection. Create one
-//! per Cluster for the lifetime of the process. The connection is released
-//! when the last clone is dropped; [`Client::close`] additionally drops the
-//! tokens and makes later calls fail with [`Error::Closed`].
+//! shares one Session, one token cache and an API channel. Managed Sessions
+//! additionally use a separate auth channel. Create one per Cluster for the
+//! lifetime of the process.
+//! [`Client::close`] cancels operations, releases owned credentials and
+//! transports, and makes later calls fail with [`Error::Closed`].
+//! [`Client::shutdown`] also waits for authentication workers to stop.
 //!
 //! # Features
 //!

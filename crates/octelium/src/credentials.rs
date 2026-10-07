@@ -67,12 +67,14 @@ impl<T: Authenticator + ?Sized> Authenticator for Arc<T> {
 
 /// Exchanges a Credential authentication token for a Cluster Session.
 ///
-/// Authentication tokens are treated as one-time credentials and are never
-/// reused automatically after the Session expires.
+/// Authentication tokens are treated as one-time credentials unless reuse is
+/// explicitly enabled with [`with_reauthentication`](Self::with_reauthentication).
 #[derive(Clone)]
+#[must_use]
 pub struct AuthenticationToken {
     token: String,
     code_verifier: Bytes,
+    reusable: bool,
 }
 
 impl AuthenticationToken {
@@ -81,6 +83,7 @@ impl AuthenticationToken {
         Self {
             token: token.into().trim().to_string(),
             code_verifier: Bytes::new(),
+            reusable: false,
         }
     }
 
@@ -89,6 +92,12 @@ impl AuthenticationToken {
     /// by the Cluster.
     pub fn with_code_verifier(mut self, code_verifier: impl Into<Bytes>) -> Self {
         self.code_verifier = code_verifier.into();
+        self
+    }
+
+    #[doc = "Allows automatic reuse only when the Credential is configured on the Cluster for repeated authentication. Defaults to false."]
+    pub fn with_reauthentication(mut self, reusable: bool) -> Self {
+        self.reusable = reusable;
         self
     }
 }
@@ -124,12 +133,17 @@ impl Authenticator for AuthenticationToken {
 
         Ok(resp.into_inner())
     }
+
+    fn can_reauthenticate(&self) -> bool {
+        self.reusable
+    }
 }
 
 type AssertionFuture = Pin<Box<dyn Future<Output = Result<String, BoxError>> + Send>>;
 
 /// Authenticates with a signed assertion, such as an OIDC ID token.
 #[derive(Clone)]
+#[must_use]
 pub struct Assertion {
     provider: Arc<dyn Fn() -> AssertionFuture + Send + Sync>,
     identity_provider: Option<metav1::ObjectReference>,
@@ -242,12 +256,21 @@ impl Authenticator for Assertion {
 pub trait AccessTokenProvider: Send + Sync + 'static {
     /// Returns a currently valid access token.
     async fn token(&self) -> Result<AccessToken, BoxError>;
+
+    #[doc = "Reports whether the provider can replace a rejected token. Fixed-token providers return false."]
+    fn can_replace_rejected_token(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait]
 impl<T: AccessTokenProvider + ?Sized> AccessTokenProvider for Arc<T> {
     async fn token(&self) -> Result<AccessToken, BoxError> {
         (**self).token().await
+    }
+
+    fn can_replace_rejected_token(&self) -> bool {
+        (**self).can_replace_rejected_token()
     }
 }
 
@@ -281,6 +304,10 @@ impl AccessTokenProvider for StaticAccessToken {
             return Err(message("empty access token"));
         }
         Ok(AccessToken::new(self.token.clone()))
+    }
+
+    fn can_replace_rejected_token(&self) -> bool {
+        false
     }
 }
 

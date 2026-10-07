@@ -103,6 +103,17 @@ impl MainService for AuthService {
                 octelium::METADATA_KEY_REFRESH_TOKEN,
             ));
 
+        if Calls::metadata(&request, octelium::METADATA_KEY_AUTH).is_some()
+            || Calls::metadata(&request, octelium::METADATA_KEY_REFRESH_TOKEN).as_deref()
+                != Some(
+                    self.sessions[index.min(self.sessions.len() - 1)]
+                        .refresh_token
+                        .as_str(),
+                )
+        {
+            return Err(Status::unauthenticated("invalid refresh metadata"));
+        }
+
         if self.refresh_fails {
             return Err(Status::unauthenticated("the Session expired"));
         }
@@ -114,26 +125,31 @@ impl MainService for AuthService {
 
     async fn logout(
         &self,
-        _request: Request<authv1::LogoutRequest>,
+        request: Request<authv1::LogoutRequest>,
     ) -> Result<Response<authv1::LogoutResponse>, Status> {
+        assert!(Calls::metadata(&request, octelium::METADATA_KEY_AUTH).is_none());
+        assert!(Calls::metadata(&request, octelium::METADATA_KEY_REFRESH_TOKEN).is_some());
         self.calls.logouts.fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(authv1::LogoutResponse {}))
     }
+}
 
-    async fn list_authenticator(
+struct ApiService {
+    calls: Arc<Calls>,
+}
+
+#[tonic::async_trait]
+impl corev1::main_service_server::MainService for ApiService {
+    async fn list_user(
         &self,
-        request: Request<authv1::ListAuthenticatorOptions>,
-    ) -> Result<Response<authv1::AuthenticatorList>, Status> {
-        // Any authenticated API call on this Service, used to observe the
-        // access token the SDK attached.
+        request: Request<corev1::ListUserOptions>,
+    ) -> Result<Response<corev1::UserList>, Status> {
         let token = Calls::metadata(&request, octelium::METADATA_KEY_AUTH).unwrap_or_default();
         self.calls.access_tokens.lock().unwrap().push(token.clone());
-
         if token != "access-1" && token != "access-2" {
             return Err(Status::unauthenticated("invalid access token"));
         }
-
-        Ok(Response::new(authv1::AuthenticatorList::default()))
+        Ok(Response::new(corev1::UserList::default()))
     }
 }
 
@@ -142,9 +158,13 @@ async fn serve(service: AuthService) -> (SocketAddr, tokio::task::JoinHandle<()>
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
+    let api = ApiService {
+        calls: service.calls.clone(),
+    };
     let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(MainServiceServer::new(service))
+            .add_service(corev1::main_service_server::MainServiceServer::new(api))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -171,6 +191,7 @@ async fn client_with(addr: SocketAddr, authenticator: impl octelium::Authenticat
     Client::builder()
         .domain("example.com")
         .api_endpoint(format!("http://{addr}"))
+        .allow_insecure_api(true)
         .authenticator(authenticator)
         .without_environment_credentials()
         .build()
@@ -192,8 +213,8 @@ async fn authenticates_once_and_attaches_the_access_token() {
 
     for _ in 0..3 {
         client
-            .auth_v1()
-            .list_authenticator(authv1::ListAuthenticatorOptions::default())
+            .core_v1()
+            .list_user(corev1::ListUserOptions::default())
             .await
             .unwrap();
     }
@@ -226,8 +247,8 @@ async fn a_rejected_token_is_replaced_on_the_next_call() {
     let client = client(addr).await;
 
     let err = client
-        .auth_v1()
-        .list_authenticator(authv1::ListAuthenticatorOptions::default())
+        .core_v1()
+        .list_user(corev1::ListUserOptions::default())
         .await
         .expect_err("the Cluster rejects the stale token");
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -235,8 +256,8 @@ async fn a_rejected_token_is_replaced_on_the_next_call() {
     // The rejection invalidated the cached token, so the Client refreshes the
     // Session before the next call rather than replaying it.
     client
-        .auth_v1()
-        .list_authenticator(authv1::ListAuthenticatorOptions::default())
+        .core_v1()
+        .list_user(corev1::ListUserOptions::default())
         .await
         .unwrap();
 
@@ -406,6 +427,7 @@ async fn an_external_access_token_is_used_as_is() {
     let client = Client::builder()
         .domain("example.com")
         .api_endpoint(format!("http://{addr}"))
+        .allow_insecure_api(true)
         .access_token("access-2")
         .without_environment_credentials()
         .build()
@@ -413,8 +435,8 @@ async fn an_external_access_token_is_used_as_is() {
         .unwrap();
 
     client
-        .auth_v1()
-        .list_authenticator(authv1::ListAuthenticatorOptions::default())
+        .core_v1()
+        .list_user(corev1::ListUserOptions::default())
         .await
         .unwrap();
 
@@ -445,8 +467,8 @@ async fn concurrent_callers_share_one_authentication() {
         let client = client.clone();
         tasks.push(tokio::spawn(async move {
             client
-                .auth_v1()
-                .list_authenticator(authv1::ListAuthenticatorOptions::default())
+                .core_v1()
+                .list_user(corev1::ListUserOptions::default())
                 .await
                 .unwrap();
         }));
