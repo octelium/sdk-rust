@@ -11,7 +11,7 @@ Add the crate from crates.io:
 
 ```toml
 [dependencies]
-cordium = "0.2"
+cordium = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures-util = "0.3" # for StreamExt
 ```
@@ -41,7 +41,10 @@ workspace.delete().await?;
 `create` returns a stopped workspace with a cluster-assigned name. `run` creates,
 starts, and waits for RUNNING under a five-minute total deadline. Use `run_with`
 for start-time variable overrides, placement, or a different wait deadline.
-Failure keeps the workspace in place for inspection; deleting it is explicit.
+Once the workspace exists, a failure of a later step is reported as
+`Error::RunFailed`, which carries the workspace so that it can be inspected or
+deleted; deleting it is explicit. `start` on a starting or running workspace is
+a no-op, and `wait_stopped` reports a failed run as `Error::WorkspaceFailed`.
 
 Dropping a client or workspace does **not** stop or delete remote workspaces.
 For cleanup after a command error, store its result, call `delete`, then propagate
@@ -111,7 +114,8 @@ let client = cordium::Client::builder().domain("example.com")
 ```
 
 `Client::from_transport` reuses an existing `octelium::Client`. Both clients
-share credentials and connections; Cordium shutdown closes that transport too.
+share credentials and connections; the caller keeps ownership of that transport,
+so Cordium shutdown leaves it open.
 
 ## Workspace configuration
 
@@ -152,9 +156,10 @@ Template to obtain authenticated git operations in its workspaces.
 
 Cloned Workspace handles share a cache. Accessors perform no network operations
 and return owned values. `refresh`, lifecycle methods, and `modify` update that
-cache; watch events are independent. `proto()`, `spec()`, and `status()` return
-owned copies. Unknown enum values remain accessible through their raw protobuf
-integer fields.
+cache; watch events are independent. `watch` yields typed `WorkspaceEvent`s and
+`logs` yields `LogEntry` values (timestamp, stage, stream and bytes). `proto()`,
+`spec()`, and `status()` return owned copies. Unknown enum values remain
+accessible through their raw protobuf integer fields.
 
 ## Commands and streaming
 
@@ -171,7 +176,7 @@ let result = workspace.exec(Command::argv(["printf", "%s", "$(literal text)"]))
     .timeout(Some(std::time::Duration::from_secs(60)))
     .await?;
 
-match workspace.exec("exit 7").await {
+match workspace.exec("exit 7").check(true).await {
     Err(Error::CommandFailed(result)) => {
         println!("exit {}: {}", result.exit_code, result.stderr_text());
     }
@@ -181,8 +186,8 @@ match workspace.exec("exit 7").await {
 # }
 ```
 
-Collected execution checks nonzero exit codes by default; `.check(false)` returns
-all exit codes as normal results. Output is binary `Bytes`; text accessors use
+Nonzero exit codes are normal results by default; `.check(true)`, or
+`ExecResult::check` afterwards, turns them into `Error::CommandFailed`. Output is binary `Bytes`; text accessors use
 UTF-8 replacement while retaining the original bytes. Capture defaults to
 **1 MiB per stdout/stderr stream**. Overflow sets `truncated`; streaming events
 still carry complete output. Zero capture size disables capture.
@@ -209,7 +214,9 @@ let result = session.wait().await?;
 Streams implement `futures_core::Stream`, are `Send`, and use backpressure instead
 of background output tasks or unbounded SDK queues. An Exit releases the RPC even
 if the server leaves it open. Dropping a session cancels its RPC; use
-`session.input().kill().await` for an explicit remote termination request.
+`session.input().kill().await` for an explicit remote termination request. A
+killed command that the cluster does not report as exited within 10 seconds
+(`.kill_grace(...)`) ends the session with the exit code -1 and `killed` set.
 
 For interactive stdin, call `.stdin_enabled(true).stream().await`, clone
 `session.input()`, and write while another task consumes output. Writes are
@@ -223,7 +230,7 @@ this with exact-length base64 framing.
 
 `workspace.files()` provides binary/text reads and writes, uploads, downloads,
 `mkdir`, and `remove`. Paths are literal: no `$HOME`, glob or tilde expansion.
-Reads cap memory at 16 MiB and reject larger files. `max_read_bytes` adjusts that
+Reads cap memory at 64 MiB and reject larger files. `max_read_bytes` adjusts that
 bound; uploads, `upload_reader`, and `download_to` stream with bounded chunks.
 Text reads use strict UTF-8. `as_root` and `timeout` customize transfer commands.
 
@@ -385,5 +392,5 @@ A real cluster smoke test remains a release check; local tests do not verify a
 particular cluster's policies, storage backend, or deployment.
 
 Release dependency order: `octelium-apis` 0.1.4, `octelium` 0.2.0, then `cordium`
-0.2.0. Packaging all workspace crates together verifies the local dependency
+0.3.0. Packaging all workspace crates together verifies the local dependency
 chain. Nothing is committed or published by the development commands above.

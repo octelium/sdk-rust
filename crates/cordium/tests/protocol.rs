@@ -50,6 +50,7 @@ struct Shared {
     rpc_delay: AtomicUsize,
     auth_fail: AtomicBool,
     stall: AtomicBool,
+    watch_events: AtomicBool,
     bad_pagination: AtomicBool,
     active_exec: AtomicUsize,
     closed_exec: AtomicUsize,
@@ -200,6 +201,11 @@ impl proto::main_service_server::MainService for Service {
             })
             .ok_or_else(|| Status::not_found("Workspace"))?;
         let status = ws.status.get_or_insert_default();
+        if status.state() != cordium::State::Stopped {
+            return Err(Status::already_exists(
+                "Workspace is already starting or running",
+            ));
+        }
         status.state = cordium::State::Running as i32;
         status.hostname = "abc.cordium.example.com".into();
         Ok(Response::new(proto::StartWorkspaceResponse {}))
@@ -255,7 +261,40 @@ impl proto::main_service_server::MainService for Service {
             self.shared.watch_delay.load(Ordering::SeqCst) as u64,
         ))
         .await;
-        Ok(Response::new(Box::pin(futures_util::stream::pending())))
+        if !self.shared.watch_events.load(Ordering::SeqCst) {
+            return Ok(Response::new(Box::pin(futures_util::stream::pending())));
+        }
+        let item = self
+            .shared
+            .data
+            .lock()
+            .unwrap()
+            .workspaces
+            .values()
+            .next()
+            .cloned()
+            .unwrap();
+        let mut old = item.clone();
+        old.status.get_or_insert_default().state = cordium::State::Stopped as i32;
+        let events = vec![
+            Ok(proto::WatchWorkspaceResponse { r#type: None }),
+            Ok(proto::WatchWorkspaceResponse {
+                r#type: Some(proto::watch_workspace_response::Type::Update(
+                    proto::watch_workspace_response::Update {
+                        new_item: Some(item.clone()),
+                        old_item: Some(old),
+                    },
+                )),
+            }),
+            Ok(proto::WatchWorkspaceResponse {
+                r#type: Some(proto::watch_workspace_response::Type::Delete(
+                    proto::watch_workspace_response::Delete { item: Some(item) },
+                )),
+            }),
+        ];
+        Ok(Response::new(Box::pin(
+            futures_util::stream::iter(events).chain(futures_util::stream::pending()),
+        )))
     }
     async fn create_space(
         &self,
@@ -411,6 +450,9 @@ impl proto::main_service_server::MainService for Service {
     ) -> Result<Response<proto::WorkspaceSnapshot>, Status> {
         check(&r)?;
         let mut resource = r.into_inner();
+        if resource.spec.is_none() {
+            return Err(Status::invalid_argument("Resource spec must be set"));
+        }
         let mut d = self.shared.data.lock().unwrap();
         let name = resource.metadata.as_ref().unwrap().name.clone();
         resource.metadata = Some(md(&name));
@@ -545,6 +587,11 @@ impl proto::main_service_server::MainService for Service {
     ) -> Result<Response<proto::Secret>, Status> {
         check(&r)?;
         let mut resource = r.into_inner();
+        if resource.spec.is_none() || resource.data.is_none() {
+            return Err(Status::invalid_argument(
+                "Resource spec and data must be set",
+            ));
+        }
         let mut d = self.shared.data.lock().unwrap();
         let name = resource.metadata.as_ref().unwrap().name.clone();
         resource.metadata = Some(md(&name));
@@ -606,6 +653,11 @@ impl proto::main_service_server::MainService for Service {
     ) -> Result<Response<proto::UserSecret>, Status> {
         check(&r)?;
         let mut resource = r.into_inner();
+        if resource.spec.is_none() || resource.data.is_none() {
+            return Err(Status::invalid_argument(
+                "Resource spec and data must be set",
+            ));
+        }
         let mut d = self.shared.data.lock().unwrap();
         let name = resource.metadata.as_ref().unwrap().name.clone();
         resource.metadata = Some(md(&name));
@@ -997,6 +1049,8 @@ impl proto::workspace_service_server::WorkspaceService for Service {
             if request.command=="FAKE_NO_EXIT"{yield stdout(Bytes::from_static(b"partial"));return;}
             if request.command=="FAKE_BINARY"{yield stdout(Bytes::from_static(&[0,255,128]));yield stderr(Bytes::from_static(b"error"));yield exit(0);std::future::pending::<()>().await;}
             if request.command=="FAKE_STATUS"{Err(Status::permission_denied("exec denied"))?;}
+            // Like the Cluster, report nothing once a command is killed and keep the RPC open.
+            if request.command=="FAKE_IGNORE_KILL"{while let Ok(Some(_))=input.message().await{}std::future::pending::<()>().await;}
             let mut command=tokio::process::Command::new("sh");command.arg("-c").arg(&request.command).current_dir(if request.working_dir.is_empty(){dir}else{request.working_dir.clone().into()}).kill_on_drop(true);
             for env in request.env_vars {command.env(env.key,env.value);}
             command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).stdin(if request.has_stdin{std::process::Stdio::piped()}else{std::process::Stdio::null()});
@@ -1016,11 +1070,12 @@ impl proto::workspace_service_server::WorkspaceService for Service {
                     Step::Out(n)=>{let n=n.map_err(|e|Status::internal(e.to_string()))?;if n==0{out_open=false;}else{yield stdout(Bytes::copy_from_slice(&outbuf[..n]));}},
                     Step::Err(n)=>{let n=n.map_err(|e|Status::internal(e.to_string()))?;if n==0{err_open=false;}else{yield stderr(Bytes::copy_from_slice(&errbuf[..n]));}},
                     Step::Exit(status)=>{code=Some(status.map_err(|e|Status::internal(e.to_string()))?.code().unwrap_or(137));},
-                    Step::Input(msg)=>{match msg?{Some(proto::ExecRequest{r#type:Some(proto::exec_request::Type::WriteData(w))})=>{if let Some(stdin)=stdin.as_mut(){stdin.write_all(&w.data).await.map_err(|e|Status::internal(e.to_string()))?;}},Some(proto::ExecRequest{r#type:Some(proto::exec_request::Type::Kill(_))})=>{child.start_kill().map_err(|e|Status::internal(e.to_string()))?;},None=>input_open=false,_=>{}}},
+                    Step::Input(msg)=>{match msg?{Some(proto::ExecRequest{r#type:Some(proto::exec_request::Type::WriteData(w))})=>{if let Some(stdin)=stdin.as_mut(){let _=stdin.write_all(&w.data).await;}},Some(proto::ExecRequest{r#type:Some(proto::exec_request::Type::Kill(_))})=>{child.start_kill().map_err(|e|Status::internal(e.to_string()))?;},None=>input_open=false,_=>{}}},
                 }
             }
             yield exit(code.unwrap());
             // Cordium keeps this RPC open after Exit; the SDK must release it itself.
+            while input_open && matches!(input.message().await, Ok(Some(_))) {}
             std::future::pending::<()>().await;
         };
         Ok(Response::new(Box::pin(stream)))
@@ -1108,7 +1163,7 @@ impl proto::workspace_service_server::WorkspaceService for Service {
         r: Request<proto::ListenLogRequest>,
     ) -> Result<Response<BoxStream<proto::ListenLogResponse>>, Status> {
         check(&r)?;
-        let stream = async_stream::try_stream! {yield proto::ListenLogResponse::default();std::future::pending::<()>().await;};
+        let stream = async_stream::try_stream! {yield proto::ListenLogResponse{created_at:Some(cordium::prost_types::Timestamp{seconds:1_700_000_000,nanos:0}),r#type:proto::listen_log_response::Type::Task as i32,mode:proto::listen_log_response::Mode::Stderr as i32,data:Bytes::from_static(b"task failed")};std::future::pending::<()>().await;};
         Ok(Response::new(Box::pin(stream)))
     }
 }
@@ -1345,9 +1400,16 @@ async fn workspace_sources_lifecycle_cache_and_urls() {
 #[tokio::test]
 async fn invalid_inputs_fail_before_creation() {
     let c = Cluster::new().await;
+    assert!(
+        WorkspaceOptions::new()
+            .template("a")
+            .snapshot("b")
+            .ephemeral(true)
+            .build_spec()
+            .unwrap()
+            .is_ephemeral
+    );
     let options = [
-        WorkspaceOptions::new().template("a").snapshot("b"),
-        WorkspaceOptions::new().snapshot("b").ephemeral(true),
         WorkspaceOptions::new().image(""),
         WorkspaceOptions::new().application(cordium::Application::new("BAD", 80)),
         WorkspaceOptions::new().application(cordium::Application::new("web", 0)),
@@ -1448,7 +1510,39 @@ async fn waits_fail_early_on_workspace_failure() {
         }
         e => panic!("{e:?}"),
     }
-    ws.wait_stopped(short_wait()).await.unwrap();
+    assert!(matches!(
+        ws.wait_stopped(short_wait()).await.unwrap_err(),
+        Error::WorkspaceFailed { .. }
+    ));
+    {
+        let mut d = c.shared.data.lock().unwrap();
+        let status = d
+            .workspaces
+            .get_mut(&ws.name())
+            .unwrap()
+            .status
+            .as_mut()
+            .unwrap();
+        status.state = cordium::State::Initializing as i32;
+        status.run = Some(proto::workspace::status::Run {
+            id: "second".into(),
+            ..Default::default()
+        });
+    }
+    let shared = c.shared.clone();
+    let name = ws.name();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut d = shared.data.lock().unwrap();
+        d.workspaces
+            .get_mut(&name)
+            .unwrap()
+            .status
+            .as_mut()
+            .unwrap()
+            .state = cordium::State::Running as i32;
+    });
+    ws.wait_running(short_wait()).await.unwrap();
 }
 #[tokio::test]
 async fn deadlines_and_shutdown_interrupt_unary_and_stream_calls() {
@@ -1507,10 +1601,15 @@ async fn execution_is_binary_bounded_checked_and_releases_rpc_on_exit() {
     assert_eq!(observed, b"0123456789");
     assert_eq!(result.stdout, b"0123"[..]);
     assert!(result.truncated);
-    let err = ws.exec("printf failed >&2; exit 7").await.unwrap_err();
+    let err = ws
+        .exec("printf failed >&2; exit 7")
+        .check(true)
+        .await
+        .unwrap_err();
     assert!(matches!(err,Error::CommandFailed(r) if r.exit_code==7 && r.stderr==b"failed"[..]));
-    let r = ws.exec("exit 3").check(false).await.unwrap();
+    let r = ws.exec("exit 3").await.unwrap();
     assert_eq!(r.exit_code, 3);
+    assert!(matches!(r.check(), Err(Error::CommandFailed(_))));
     tokio::time::timeout(Duration::from_secs(2), async {
         while c.shared.active_exec.load(Ordering::SeqCst) > 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1543,6 +1642,13 @@ async fn command_argv_environment_stdin_kill_and_protocol_errors() {
         .await
         .unwrap();
     assert_eq!(r.stdout, Bytes::from_static(&[0, 255, 1, 2]));
+    let r = ws
+        .exec("head -c 1")
+        .stdin(vec![b'x'; 16 * 1024 * 1024])
+        .timeout(Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    assert_eq!(r.stdout, Bytes::from_static(b"x"));
     let session = ws
         .exec("exec sleep 5")
         .stdin_enabled(true)
@@ -1771,7 +1877,8 @@ async fn resource_crud_secrets_memberships_and_preferences() {
     assert!(
         c.shared.data.lock().unwrap().user_secrets["ssh"]
             .data
-            .is_none()
+            .as_ref()
+            .is_some_and(|d| d.r#type.is_none())
     );
     let member = c
         .client
@@ -2179,4 +2286,119 @@ async fn http_authorization_is_scoped_before_token_exchange() {
     );
     assert_eq!(c.shared.auth_calls.load(Ordering::SeqCst), 0);
     client.close();
+}
+#[tokio::test]
+async fn kill_without_an_exit_ends_after_the_grace_period() {
+    let c = Cluster::new().await;
+    let ws = c.workspace().await;
+    let session = ws
+        .exec("FAKE_IGNORE_KILL")
+        .stdin_enabled(true)
+        .kill_grace(Duration::from_millis(50))
+        .stream()
+        .await
+        .unwrap();
+    session.input().kill().await.unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(5), session.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.exit_code, -1);
+    assert!(r.killed);
+}
+#[tokio::test]
+async fn finished_sessions_release_their_rpc_while_input_handles_live() {
+    let c = Cluster::new().await;
+    let ws = c.workspace().await;
+    let session = ws.exec("true").stdin_enabled(true).stream().await.unwrap();
+    let input = session.input();
+    session.wait().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while c.shared.active_exec.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(input.write(b"late").await.is_err());
+}
+#[tokio::test]
+async fn start_is_idempotent_and_run_returns_the_created_workspace() {
+    let c = Cluster::new().await;
+    let ws = c.workspace().await;
+    ws.start(StartOptions::default()).await.unwrap();
+    ws.start(StartOptions::default()).await.unwrap();
+    assert!(ws.is_running());
+    c.shared.stall.store(true, Ordering::SeqCst);
+    let err = c
+        .client
+        .workspaces()
+        .run_with(
+            WorkspaceOptions::new().image("python:3.14"),
+            StartOptions::default(),
+            WaitOptions::default().timeout(Some(Duration::from_millis(100))),
+        )
+        .await
+        .unwrap_err();
+    c.shared.stall.store(false, Ordering::SeqCst);
+    assert_eq!(err.code(), Some(tonic::Code::DeadlineExceeded));
+    match err {
+        Error::RunFailed { workspace, source } => {
+            assert!(matches!(*source, Error::DeadlineExceeded));
+            workspace.delete().await.unwrap();
+        }
+        e => panic!("{e:?}"),
+    }
+    assert!(
+        c.client
+            .workspaces()
+            .create(WorkspaceOptions::new().env("EMPTY", ""))
+            .await
+            .is_err()
+    );
+}
+#[tokio::test]
+async fn closing_does_not_close_a_supplied_octelium_client() {
+    let c = Cluster::new().await;
+    let transport = c.client.transport().clone();
+    let client = Client::from_transport(transport.clone());
+    client.close();
+    assert!(client.is_closed());
+    assert!(!transport.is_closed());
+    c.client
+        .workspaces()
+        .list(ListOptions::new())
+        .await
+        .unwrap();
+}
+#[tokio::test]
+async fn watch_and_logs_yield_typed_events() {
+    let c = Cluster::new().await;
+    let ws = c.workspace().await;
+    ws.start(StartOptions::default()).await.unwrap();
+    c.shared.watch_events.store(true, Ordering::SeqCst);
+    let mut events = ws.watch(StreamOptions::default()).await.unwrap();
+    match events.next().await.unwrap().unwrap() {
+        cordium::WorkspaceEvent::Updated {
+            workspace,
+            previous,
+        } => {
+            assert_eq!(workspace.state(), cordium::State::Running);
+            assert!(previous.is_some());
+        }
+        e => panic!("{e:?}"),
+    }
+    let deleted = events.next().await.unwrap().unwrap();
+    assert!(matches!(deleted, cordium::WorkspaceEvent::Deleted(_)));
+    assert_eq!(deleted.workspace().name(), ws.name());
+    assert!(deleted.state_changed());
+    let mut logs = ws.logs(StreamOptions::default()).await.unwrap();
+    let entry = logs.next().await.unwrap().unwrap();
+    assert_eq!(entry.stage, cordium::LogStage::Task);
+    assert_eq!(entry.stream, cordium::LogStream::Stderr);
+    assert_eq!(&entry.data[..], b"task failed");
+    assert_eq!(
+        entry.at,
+        Some(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+    );
 }

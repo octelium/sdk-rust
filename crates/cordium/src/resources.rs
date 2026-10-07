@@ -764,6 +764,7 @@ impl Snapshots {
                     .main_service()
                     .create_workspace_snapshot(proto::WorkspaceSnapshot {
                         metadata: Some(metadata(name)),
+                        spec: Some(proto::workspace_snapshot::Spec {}),
                         status: Some(proto::workspace_snapshot::Status {
                             workspace_ref: Some(workspace.into().object()?),
                             ..Default::default()
@@ -974,6 +975,7 @@ impl Secrets {
         self.client
             .rpc(self.client.main_service().create_secret(proto::Secret {
                 metadata: Some(metadata(name)),
+                spec: Some(proto::secret::Spec {}),
                 data: Some(proto::secret::Data {
                     r#type: Some(value),
                 }),
@@ -1029,6 +1031,7 @@ impl UserSecrets {
                     .main_service()
                     .create_user_secret(proto::UserSecret {
                         metadata: Some(metadata(name)),
+                        spec: Some(proto::user_secret::Spec::default()),
                         data: Some(proto::user_secret::Data {
                             r#type: Some(value),
                         }),
@@ -1048,6 +1051,7 @@ impl UserSecrets {
                     .create_user_secret(proto::UserSecret {
                         metadata: Some(metadata(name)),
                         spec: Some(proto::user_secret::Spec { r#type: 1 }),
+                        data: Some(proto::user_secret::Data::default()),
                         ..Default::default()
                     }),
             )

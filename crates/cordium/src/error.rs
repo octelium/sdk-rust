@@ -1,4 +1,4 @@
-use crate::{ExecResult, proto};
+use crate::{ExecResult, Workspace, proto};
 
 /// Result returned by Cordium SDK operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -33,6 +33,16 @@ pub enum Error {
         /// Description of the failure.
         message: String,
     },
+    /// A Workspace was created by `run` or `run_with` but a later step failed. The
+    /// Workspace is returned so that it can be inspected or deleted rather than leaked.
+    #[error("cordium: workspace {name} was created but is not running: {source}", name = .workspace.name())]
+    RunFailed {
+        /// The created Workspace.
+        workspace: Box<Workspace>,
+        /// The failure of the start or of the wait.
+        #[source]
+        source: Box<Error>,
+    },
     /// An asynchronous template build, snapshot or volume failed.
     #[error("cordium: {kind} failed: {message}")]
     ResourceFailed {
@@ -58,6 +68,7 @@ impl Error {
     /// Returns the gRPC status code, if this error originated from a status.
     pub fn code(&self) -> Option<tonic::Code> {
         match self {
+            Self::RunFailed { source, .. } => source.code(),
             Self::Status(s) | Self::Transport(octelium::Error::Status(s)) => Some(s.code()),
             Self::Closed => Some(tonic::Code::Cancelled),
             Self::DeadlineExceeded => Some(tonic::Code::DeadlineExceeded),

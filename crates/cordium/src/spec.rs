@@ -202,12 +202,12 @@ impl WorkspaceOptions {
         self.display_name = v.into();
         self
     }
-    /// Creates from a Template. Mutually exclusive with a snapshot source.
+    /// Creates from a Template. With a snapshot, it defaults to the snapshot's Template and must share its Space.
     pub fn template(mut self, v: impl Into<Reference>) -> Self {
         self.template = Some(v.into());
         self
     }
-    /// Restores persistent storage from a snapshot. Cannot be combined with ephemeral storage.
+    /// Restores storage from a snapshot. An ephemeral Workspace restores it on every run.
     pub fn snapshot(mut self, v: impl Into<Reference>) -> Self {
         self.snapshot = Some(v.into());
         self
@@ -368,16 +368,6 @@ impl WorkspaceOptions {
         Ok(self.spec)
     }
     pub(crate) fn validate(&mut self) -> Result<()> {
-        if self.template.is_some() && self.snapshot.is_some() {
-            return Err(Error::InvalidArgument(
-                "template and snapshot sources are mutually exclusive".into(),
-            ));
-        }
-        if self.snapshot.is_some() && self.spec.is_ephemeral {
-            return Err(Error::InvalidArgument(
-                "snapshots require persistent storage".into(),
-            ));
-        }
         for r in [&self.template, &self.snapshot].into_iter().flatten() {
             r.object()?;
         }
@@ -437,8 +427,17 @@ impl WorkspaceOptions {
         if let Some(rt) = &self.spec.runtime {
             for e in &rt.env_vars {
                 validate_env_key(&e.key)?;
-                if let Some(runtime::env_var::Type::FromSecret(v)) = &e.r#type {
-                    crate::error::nonempty(v, "Secret name")?;
+                match &e.r#type {
+                    Some(runtime::env_var::Type::FromSecret(v)) => {
+                        crate::error::nonempty(v, "Secret name")?
+                    }
+                    Some(runtime::env_var::Type::Value(v)) if v.is_empty() => {
+                        return Err(Error::InvalidArgument(format!(
+                            "environment variable {} has an empty value",
+                            e.key
+                        )));
+                    }
+                    _ => {}
                 }
             }
             let mut tasks = HashSet::new();
@@ -452,6 +451,12 @@ impl WorkspaceOptions {
                 }
                 for e in &task.env_vars {
                     validate_env_key(&e.key)?;
+                    if e.value.is_empty() {
+                        return Err(Error::InvalidArgument(format!(
+                            "task environment variable {} has an empty value",
+                            e.key
+                        )));
+                    }
                 }
             }
             let mut mounts = Vec::<&str>::new();

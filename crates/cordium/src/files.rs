@@ -22,7 +22,7 @@ impl Files {
             workspace,
             root: false,
             timeout: Some(std::time::Duration::from_secs(300)),
-            max_read: 16 * 1024 * 1024,
+            max_read: 64 * 1024 * 1024,
         }
     }
     /// Runs transfer commands as root.
@@ -35,7 +35,7 @@ impl Files {
         self.timeout = value;
         self
     }
-    /// Sets the in-memory read bound, default 16 MiB. Use downloads for larger files.
+    /// Sets the in-memory read bound, default 64 MiB. Use downloads for larger files.
     pub fn max_read_bytes(mut self, value: usize) -> Self {
         self.max_read = value;
         self
@@ -54,6 +54,7 @@ impl Files {
             .as_root(self.root)
             .timeout(self.timeout)
             .max_capture_bytes(bound)
+            .check(true)
             .await?;
         if result.stdout.len() > self.max_read || result.truncated {
             return Err(Error::LimitExceeded(format!(
@@ -163,6 +164,7 @@ impl Files {
                     .as_root(self.root)
                     .timeout(self.timeout)
                     .max_capture_bytes(8192)
+                    .check(true)
                     .stream()
                     .await?;
                 while let Some(event) = session.next().await {
@@ -217,6 +219,7 @@ impl Files {
             .exec(format!("mkdir -p {}", shell_quote(&path)?))
             .as_root(self.root)
             .timeout(self.timeout)
+            .check(true)
             .await?;
         Ok(())
     }
@@ -232,6 +235,7 @@ impl Files {
             ))
             .as_root(self.root)
             .timeout(self.timeout)
+            .check(true)
             .await?;
         Ok(())
     }

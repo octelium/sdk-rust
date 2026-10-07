@@ -26,7 +26,10 @@ pub use resources::{
 pub use spec::{Application, EnvValue, Resources, Task, TaskPhase, WorkspaceOptions};
 pub use stream::{EventStream, StreamOptions};
 pub use terminal::{Terminal, TerminalEvent, TerminalInput, TerminalOptions, Terminals};
-pub use workspace::{SharingMode, StartOptions, State, Workspace, Workspaces};
+pub use workspace::{
+    LogEntry, LogStage, LogStream, SharingMode, StartOptions, State, Workspace, WorkspaceEvent,
+    Workspaces,
+};
 
 /// Credential implementations and extension traits shared with the Octelium client.
 pub use octelium::{

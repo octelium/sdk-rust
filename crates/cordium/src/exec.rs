@@ -14,7 +14,11 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Mutex, mpsc};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
+
+/// How long a killed command is given to report its exit before the session ends on
+/// its own. The Cluster sends SIGTERM to the process group, then SIGKILL after 5 seconds.
+const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(10);
 
 /// An explicit shell command or safely quoted argument vector.
 #[derive(Clone, Debug)]
@@ -140,6 +144,7 @@ pub struct ExecBuilder {
     check: bool,
     has_stdin: bool,
     stdin: Option<Bytes>,
+    kill_grace: Duration,
 }
 impl ExecBuilder {
     pub(crate) fn new(workspace: Workspace, command: Command) -> Self {
@@ -151,9 +156,10 @@ impl ExecBuilder {
             root: false,
             timeout: None,
             capture: 1024 * 1024,
-            check: true,
+            check: false,
             has_stdin: false,
             stdin: None,
+            kill_grace: DEFAULT_KILL_GRACE,
         }
     }
     /// Adds a command environment variable.
@@ -181,9 +187,16 @@ impl ExecBuilder {
         self.capture = value;
         self
     }
-    /// Whether a nonzero exit becomes `Error::CommandFailed` during collected execution or wait. Default true.
+    /// Whether a nonzero exit becomes `Error::CommandFailed` during collected execution or wait.
+    /// Default false; [`ExecResult::check`] applies it to a result afterwards.
     pub fn check(mut self, value: bool) -> Self {
         self.check = value;
+        self
+    }
+    /// Sets how long a killed command is given to report its exit before the session ends
+    /// on its own with the exit code -1 and `killed` set. Default 10 seconds.
+    pub fn kill_grace(mut self, value: Duration) -> Self {
+        self.kill_grace = value;
         self
     }
     /// Supplies initial bytes for collected execution. The protocol has no stdin EOF message.
@@ -208,8 +221,8 @@ impl ExecBuilder {
                 let session = self.stream().await?;
                 if let Some(data) = input {
                     let writer = session.input();
-                    let (_, result) = tokio::try_join!(writer.write(data), session.wait())?;
-                    Ok(result)
+                    let (_, result) = tokio::join!(writer.write(data), session.wait());
+                    result
                 } else {
                     session.wait().await
                 }
@@ -271,6 +284,11 @@ impl ExecBuilder {
         };
         tx.try_send(request)
             .map_err(|_| Error::Protocol("could not initialize exec request queue".into()))?;
+        // Ending the request stream with the session releases the server-side RPC even
+        // while a cloned input handle is still alive.
+        let ended = CancellationToken::new();
+        let requests = tokio_stream::wrappers::ReceiverStream::new(rx)
+            .take_until(ended.clone().cancelled_owned());
         let stream = self
             .workspace
             .client
@@ -279,14 +297,14 @@ impl ExecBuilder {
                     .workspace
                     .client
                     .workspace_service()
-                    .exec(tokio_stream::wrappers::ReceiverStream::new(rx))
+                    .exec(requests)
                     .await?
                     .into_inner())
             })
             .await?;
         let output = crate::stream::rpc_stream(self.workspace.client.clone(), stream, deadline);
-        let ended = CancellationToken::new();
         let killed = Arc::new(AtomicBool::new(false));
+        let kill_expired = CancellationToken::new();
         let input = ExecInput {
             sender: tx,
             ended: ended.clone(),
@@ -294,6 +312,8 @@ impl ExecBuilder {
             lock: Arc::new(Mutex::new(())),
             enabled: self.has_stdin,
             killed: killed.clone(),
+            kill_grace: self.kill_grace,
+            kill_expired: kill_expired.clone(),
         };
         Ok(ExecSession {
             output: Some(output),
@@ -307,6 +327,7 @@ impl ExecBuilder {
             error: None,
             ended,
             killed,
+            kill_expired: Box::pin(kill_expired.cancelled_owned()),
         })
     }
 }
@@ -327,6 +348,8 @@ pub struct ExecInput {
     lock: Arc<Mutex<()>>,
     enabled: bool,
     killed: Arc<AtomicBool>,
+    kill_grace: Duration,
+    kill_expired: CancellationToken,
 }
 impl ExecInput {
     /// Writes binary stdin in chunks of at most 32 KiB. Manual stdin must be enabled.
@@ -348,11 +371,24 @@ impl ExecInput {
         Ok(())
     }
     /// Requests termination of the remote process. Continue consuming output to receive its exit.
+    /// A command whose exit is not reported within the kill grace period ends the session on its
+    /// own with the exit code -1.
     pub async fn kill(&self) -> Result<()> {
         self.send(proto::exec_request::Type::Kill(
             proto::exec_request::Kill {},
         ))
         .await?;
+        let (ended, expired, grace) = (
+            self.ended.clone(),
+            self.kill_expired.clone(),
+            self.kill_grace,
+        );
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = ended.cancelled() => {}
+                _ = tokio::time::sleep(grace) => expired.cancel(),
+            }
+        });
         Ok(())
     }
     async fn send(&self, message: proto::exec_request::Type) -> Result<()> {
@@ -374,7 +410,6 @@ impl ExecInput {
 /// when an Exit is received the RPC is released immediately. Dropping this
 /// session cancels its RPC. Remote command termination follows the server's
 /// cancellation behavior; use `input().kill()` for an explicit kill request.
-#[derive(Debug)]
 #[must_use = "consume the session or call wait"]
 pub struct ExecSession {
     output: Option<EventStream<proto::ExecResponse>>,
@@ -388,6 +423,15 @@ pub struct ExecSession {
     error: Option<Error>,
     ended: CancellationToken,
     killed: Arc<AtomicBool>,
+    kill_expired: Pin<Box<WaitForCancellationFutureOwned>>,
+}
+impl std::fmt::Debug for ExecSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecSession")
+            .field("input", &self.input)
+            .field("result", &self.result)
+            .finish_non_exhaustive()
+    }
 }
 impl ExecSession {
     /// Obtains a clonable write/kill handle that can be used concurrently with output consumption.
@@ -434,6 +478,21 @@ impl Stream for ExecSession {
     type Item = Result<ExecEvent>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            if self.output.is_none() {
+                return Poll::Ready(None);
+            }
+            if self.kill_expired.as_mut().poll(cx).is_ready() {
+                let result = ExecResult {
+                    exit_code: -1,
+                    stdout: self.stdout.split().freeze(),
+                    stderr: self.stderr.split().freeze(),
+                    truncated: self.truncated,
+                    killed: true,
+                };
+                self.result = Some(result);
+                self.finish();
+                return Poll::Ready(Some(Ok(ExecEvent::Exit(-1))));
+            }
             let Some(output) = self.output.as_mut() else {
                 return Poll::Ready(None);
             };

@@ -14,6 +14,7 @@ pub struct Client {
 #[derive(Debug)]
 pub(crate) struct Inner {
     transport: octelium::Client,
+    owns_transport: bool,
     pub(crate) closed: CancellationToken,
     timeout: Option<Duration>,
 }
@@ -30,11 +31,13 @@ impl Client {
     pub async fn from_env() -> Result<Self> {
         Self::builder().build().await
     }
-    /// Reuses an existing authenticated Octelium client. Shutdown closes that shared client too.
+    /// Reuses an existing authenticated Octelium client, its Session and its connections.
+    /// The caller keeps ownership of it: [`Self::close`] does not close it.
     pub fn from_transport(transport: octelium::Client) -> Self {
         Self {
             inner: Arc::new(Inner {
                 transport,
+                owns_transport: false,
                 closed: CancellationToken::new(),
                 timeout: Some(Duration::from_secs(30)),
             }),
@@ -60,10 +63,13 @@ impl Client {
         .await
     }
     /// Cancels active high-level operations and prevents future calls on every clone.
-    /// This does not delete resources or log out the server Session.
+    /// This does not delete resources or log out the server Session, and it leaves an
+    /// Octelium client supplied through [`Self::from_transport`] open.
     pub fn close(&self) {
         self.inner.closed.cancel();
-        self.inner.transport.close();
+        if self.inner.owns_transport {
+            self.inner.transport.close();
+        }
     }
     /// Returns whether this client or its shared transport has been closed.
     pub fn is_closed(&self) -> bool {
@@ -302,6 +308,7 @@ impl ClientBuilder {
         Ok(Client {
             inner: Arc::new(Inner {
                 transport,
+                owns_transport: true,
                 closed: CancellationToken::new(),
                 timeout: self.timeout,
             }),

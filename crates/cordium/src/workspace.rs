@@ -1,10 +1,13 @@
+use crate::Bytes;
 use crate::{
     Client, Error, EventStream, ListFilter, ListOptions, Page, Reference, Result, StreamOptions,
     WaitOptions, WorkspaceOptions, meta, proto,
 };
+use futures_util::StreamExt;
 use std::{
     collections::BTreeMap,
     sync::{Arc, RwLock},
+    time::SystemTime,
 };
 
 /// Generated lifecycle state enum. Unknown future values remain available in the raw status.
@@ -16,6 +19,133 @@ pub enum SharingMode {
     Members,
     /// All authenticated users in the cluster.
     All,
+}
+/// A create, update or delete event of a watched Workspace.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum WorkspaceEvent {
+    /// A Workspace was created.
+    Created(Workspace),
+    /// A Workspace was updated, which is how every state transition is reported.
+    Updated {
+        /// The Workspace after the update.
+        workspace: Workspace,
+        /// The Workspace before the update, when the server reported it.
+        previous: Option<Box<proto::Workspace>>,
+    },
+    /// A Workspace was deleted.
+    Deleted(Workspace),
+}
+impl WorkspaceEvent {
+    /// Returns the Workspace the event is about, as it is after the event.
+    pub fn workspace(&self) -> &Workspace {
+        match self {
+            Self::Created(w) | Self::Deleted(w) => w,
+            Self::Updated { workspace, .. } => workspace,
+        }
+    }
+    /// Whether the event carries an actual state transition. Creations and deletions do.
+    pub fn state_changed(&self) -> bool {
+        match self {
+            Self::Updated {
+                workspace,
+                previous: Some(previous),
+            } => {
+                previous
+                    .status
+                    .as_ref()
+                    .map(|s| s.state())
+                    .unwrap_or(State::Unknown)
+                    != workspace.state()
+            }
+            _ => true,
+        }
+    }
+    fn from_message(
+        client: &Client,
+        message: proto::WatchWorkspaceResponse,
+    ) -> Result<Option<Self>> {
+        use proto::watch_workspace_response::Type;
+        Ok(match message.r#type {
+            Some(Type::Create(e)) => e
+                .item
+                .map(|w| Workspace::new(client.clone(), w))
+                .transpose()?
+                .map(Self::Created),
+            Some(Type::Update(e)) => match e.new_item {
+                Some(w) => Some(Self::Updated {
+                    workspace: Workspace::new(client.clone(), w)?,
+                    previous: e.old_item.map(Box::new),
+                }),
+                None => None,
+            },
+            Some(Type::Delete(e)) => e
+                .item
+                .map(|w| Workspace::new(client.clone(), w))
+                .transpose()?
+                .map(Self::Deleted),
+            None => None,
+        })
+    }
+}
+/// The initialization stage that produced a log entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LogStage {
+    /// An unclassified stage.
+    Unknown,
+    /// Cloning a repository.
+    CloningRepo,
+    /// Pulling the container image.
+    PullingImage,
+    /// Building the container image.
+    BuildingImage,
+    /// A lifecycle task.
+    Task,
+}
+/// The output stream on which a log entry was emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogStream {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+/// A single entry of a Workspace's initialization logs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LogEntry {
+    /// When the entry was produced, if the server reported it.
+    pub at: Option<SystemTime>,
+    /// The initialization stage that produced the entry.
+    pub stage: LogStage,
+    /// The output stream on which the entry was emitted.
+    pub stream: LogStream,
+    /// The raw content of the entry.
+    pub data: Bytes,
+}
+impl From<proto::ListenLogResponse> for LogEntry {
+    fn from(message: proto::ListenLogResponse) -> Self {
+        use proto::listen_log_response::{Mode, Type};
+        Self {
+            at: message
+                .created_at
+                .and_then(|t| SystemTime::try_from(t).ok()),
+            stage: match message.r#type() {
+                Type::CloningRepo => LogStage::CloningRepo,
+                Type::PullingImage => LogStage::PullingImage,
+                Type::BuildingImage => LogStage::BuildingImage,
+                Type::Task => LogStage::Task,
+                _ => LogStage::Unknown,
+            },
+            stream: if message.mode() == Mode::Stderr {
+                LogStream::Stderr
+            } else {
+                LogStream::Stdout
+            },
+            data: message.data,
+        }
+    }
 }
 /// Run-specific variables and placement; they do not alter the stored spec.
 #[derive(Clone, Debug, Default)]
@@ -99,7 +229,10 @@ impl Workspaces {
         Workspace::new(self.client.clone(), resource)
     }
     /// Creates, starts, and waits for RUNNING under one five-minute deadline.
-    /// A failure preserves the Workspace for inspection; deletion is always explicit.
+    ///
+    /// Once the Workspace exists, a failure of a later step is reported as
+    /// [`Error::RunFailed`], which carries the Workspace so that it can be inspected
+    /// or deleted. Deletion is always explicit.
     pub async fn run(&self, options: WorkspaceOptions) -> Result<Workspace> {
         self.run_with(options, StartOptions::default(), WaitOptions::default())
             .await
@@ -114,14 +247,29 @@ impl Workspaces {
         let wait = wait.validate()?;
         options.validate()?;
         start.config()?;
+        let deadline = wait
+            .timeout
+            .map(|t| {
+                tokio::time::Instant::now()
+                    .checked_add(t)
+                    .ok_or_else(|| Error::InvalidArgument("timeout is too large".into()))
+            })
+            .transpose()?;
+        let ws = self
+            .client
+            .operation_until(deadline, self.create(options))
+            .await?;
         self.client
-            .operation(wait.timeout, async {
-                let ws = self.create(options).await?;
+            .operation_until(deadline, async {
                 ws.start(start).await?;
-                ws.wait_loop(WaitTarget::Running, wait).await?;
-                Ok(ws)
+                ws.wait_loop(WaitTarget::Running, wait).await
             })
             .await
+            .map_err(|source| Error::RunFailed {
+                workspace: Box::new(ws.clone()),
+                source: Box::new(source),
+            })?;
+        Ok(ws)
     }
     /// Fetches a Workspace by name or UID.
     pub async fn get(&self, reference: impl Into<Reference>) -> Result<Workspace> {
@@ -199,7 +347,7 @@ impl Workspaces {
         &self,
         reference: Option<Reference>,
         options: StreamOptions,
-    ) -> Result<EventStream<proto::WatchWorkspaceResponse>> {
+    ) -> Result<EventStream<WorkspaceEvent>> {
         let deadline = options.deadline()?;
         let request = proto::WatchWorkspaceRequest {
             workspace_ref: reference.as_ref().map(Reference::object).transpose()?,
@@ -212,10 +360,14 @@ impl Workspaces {
                     .await
             })
             .await?;
-        Ok(crate::stream::rpc_stream(
-            self.client.clone(),
-            rpc,
-            deadline,
+        let client = self.client.clone();
+        Ok(EventStream::new(
+            crate::stream::rpc_stream(self.client.clone(), rpc, deadline).filter_map(move |item| {
+                std::future::ready(match item {
+                    Ok(message) => WorkspaceEvent::from_message(&client, message).transpose(),
+                    Err(e) => Some(Err(e)),
+                })
+            }),
         ))
     }
 }
@@ -412,20 +564,24 @@ impl Workspace {
         Ok(())
     }
     /// Requests start, then refreshes cached state; does not wait for readiness.
+    /// Starting a Workspace that is already starting or running is a no-op.
     pub async fn start(&self, options: StartOptions) -> Result<()> {
         self.client
             .operation(self.client.default_timeout(), async {
                 let config = options.config()?;
-                self.client
-                    .rpc(
-                        self.client
-                            .main_service()
-                            .start_workspace(proto::StartWorkspaceRequest {
+                let started =
+                    self.client
+                        .rpc(self.client.main_service().start_workspace(
+                            proto::StartWorkspaceRequest {
                                 workspace_ref: Some(self.object()?),
                                 config: Some(config),
-                            }),
-                    )
-                    .await?;
+                            },
+                        ))
+                        .await;
+                match started {
+                    Err(e) if e.code() != Some(tonic::Code::AlreadyExists) => return Err(e),
+                    _ => {}
+                }
                 self.refresh().await
             })
             .await
@@ -479,7 +635,8 @@ impl Workspace {
     pub async fn wait_running(&self, options: WaitOptions) -> Result<()> {
         self.wait(WaitTarget::Running, options).await
     }
-    /// Waits for STOPPED, allowing a failed run to finish stopping.
+    /// Waits for STOPPED. A run that failed is reported as [`Error::WorkspaceFailed`]
+    /// once it has finished stopping.
     pub async fn wait_stopped(&self, options: WaitOptions) -> Result<()> {
         self.wait(WaitTarget::Stopped, options).await
     }
@@ -499,20 +656,23 @@ impl Workspace {
                 WaitTarget::Running => s.state() == State::Running,
                 WaitTarget::Stopped => s.state() == State::Stopped,
             };
-            if done {
+            let failure = match &s.run {
+                Some(run) => run.failure.as_ref(),
+                None => s.failure.as_ref(),
+            };
+            if done && (failure.is_none() || !matches!(target, WaitTarget::Stopped)) {
                 return Ok(());
             }
-            if !matches!(target, WaitTarget::Stopped)
-                && (s.failure.is_some()
-                    || matches!(
-                        s.state(),
-                        State::StoppingRequest | State::Stopping | State::Stopped
-                    ))
+            if done
+                || (!matches!(target, WaitTarget::Stopped)
+                    && (failure.is_some()
+                        || matches!(
+                            s.state(),
+                            State::StoppingRequest | State::Stopping | State::Stopped
+                        )))
             {
                 return Err(Error::WorkspaceFailed {
-                    message: s
-                        .failure
-                        .as_ref()
+                    message: failure
                         .map(|f| f.message.clone())
                         .unwrap_or_else(|| format!("workspace is {}", s.state().as_str_name())),
                     workspace: Box::new(ws),
@@ -564,20 +724,15 @@ impl Workspace {
             .await
     }
     /// Watches this Workspace. Dropping the stream cancels the subscription.
-    pub async fn watch(
-        &self,
-        options: StreamOptions,
-    ) -> Result<EventStream<proto::WatchWorkspaceResponse>> {
+    pub async fn watch(&self, options: StreamOptions) -> Result<EventStream<WorkspaceEvent>> {
         self.client
             .workspaces()
             .watch(Some(self.reference()), options)
             .await
     }
-    /// Streams initialization logs as typed protocol messages.
-    pub async fn logs(
-        &self,
-        options: StreamOptions,
-    ) -> Result<EventStream<proto::ListenLogResponse>> {
+    /// Streams the initialization logs: repository cloning, image pulling and building,
+    /// and lifecycle task output.
+    pub async fn logs(&self, options: StreamOptions) -> Result<EventStream<LogEntry>> {
         let deadline = options.deadline()?;
         let request = proto::ListenLogRequest {
             workspace_ref: Some(self.object()?),
@@ -590,10 +745,9 @@ impl Workspace {
                     .await
             })
             .await?;
-        Ok(crate::stream::rpc_stream(
-            self.client.clone(),
-            rpc,
-            deadline,
+        Ok(EventStream::new(
+            crate::stream::rpc_stream(self.client.clone(), rpc, deadline)
+                .map(|item| item.map(LogEntry::from)),
         ))
     }
     /// Starts a command builder. Await it directly to collect output or call `stream`.
